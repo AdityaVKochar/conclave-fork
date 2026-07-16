@@ -924,14 +924,23 @@ internal class SocketIOManager {
     internal suspend fun sendChat(
         content: String,
         gif: ChatGifAttachment? = null,
+        image: ChatImageAttachment? = null,
         recipient: String? = null,
         replyTo: ChatReplyPreview? = null
     ): ChatMessage {
-        val request = SendChatRequest(content = content, gif = gif, recipient = recipient, replyTo = replyTo)
+        val request = SendChatRequest(content = content, gif = gif, image = image, recipient = recipient, replyTo = replyTo)
         val data = emit(SocketEvent.sendChat, request)
         val response = JSONDecoder().decode(SendChatResponse::class, from = data)
         val notification = response.message ?: throw ErrorException("Missing chat message acknowledgement.")
         return notification.toChatMessage(activeRoomId)
+    }
+
+    internal suspend fun authorizeChatImageUpload(): ChatImageUploadAuthorization {
+        // The server handler is `(_data, callback)`: send an empty payload so
+        // the ack callback binds to the second slot (ack-only emits never get
+        // answered by this handler).
+        val data = emit(SocketEvent.chatImageUploadAuthorize, JSONObject())
+        return JSONDecoder().decode(ChatImageUploadAuthorization::class, from = data)
     }
 
     internal suspend fun requestConclaveAuthorization(
@@ -2653,11 +2662,22 @@ internal class SocketIOManager {
             content = stringField(obj, "content") ?: return null,
             timestamp = doubleField(obj, "timestamp") ?: return null,
             gif = obj.optJSONObject("gif")?.let { decodeChatGifAttachmentObject(it) },
+            image = obj.optJSONObject("image")?.let { decodeChatImageAttachmentObject(it) },
             isDirect = boolField(obj, "isDirect"),
             dmTargetUserId = stringField(obj, "dmTargetUserId"),
             dmTargetDisplayName = stringField(obj, "dmTargetDisplayName"),
             roomId = stringField(obj, "roomId"),
             replyTo = obj.optJSONObject("replyTo")?.let { decodeChatReplyPreviewObject(it) }
+        )
+    }
+
+    private fun decodeChatImageAttachmentObject(obj: JSONObject): ChatImageAttachment? {
+        return ChatImageAttachment(
+            id = stringField(obj, "id") ?: return null,
+            url = stringField(obj, "url") ?: return null,
+            fileName = stringField(obj, "fileName") ?: "Image",
+            mimeType = stringField(obj, "mimeType") ?: "image/jpeg",
+            size = doubleField(obj, "size")?.toInt() ?: 0
         )
     }
 
@@ -2684,7 +2704,8 @@ internal class SocketIOManager {
             content = stringField(obj, "content") ?: "",
             hasGif = boolField(obj, "hasGif") ?: false,
             isDirect = boolField(obj, "isDirect"),
-            dmTargetUserId = stringField(obj, "dmTargetUserId")
+            dmTargetUserId = stringField(obj, "dmTargetUserId"),
+            hasImage = boolField(obj, "hasImage")
         )
     }
 
@@ -3167,6 +3188,7 @@ internal class SocketIOManager {
             content = content,
             timestamp = Date(timeIntervalSince1970 = timestamp / 1000.0),
             gif = gif,
+            image = image,
             isDirect = isDirect ?: false,
             dmTargetUserId = dmTargetUserId,
             dmTargetDisplayName = dmTargetDisplayName,

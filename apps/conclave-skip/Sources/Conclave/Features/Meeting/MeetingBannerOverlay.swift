@@ -111,7 +111,7 @@ struct MeetingBannerOverlay: View {
                         iconTint: "amber",
                         iconColor: ACMColors.primaryOrange,
                         text: viewModel.state.serverRestartNotice ??
-                            "Connection interrupted. Restoring audio and video — mic and camera changes will be applied.",
+                            "Connection interrupted. Restoring audio and video. Mic and camera changes will be applied.",
                         background: ACMColors.surfaceRaised,
                         border: ACMColors.border,
                         showSpinner: true

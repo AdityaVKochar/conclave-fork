@@ -160,16 +160,32 @@ struct ToggleMediaRequest: Codable {
 struct SendChatRequest: Codable {
     let content: String
     let gif: ChatGifAttachment?
+    let image: ChatImageAttachment?
     // The SFU also resolves DMs from "/dm <name>" and "@<name>" content.
     let recipient: String?
     let replyTo: ChatReplyPreview?
 
-    init(content: String, gif: ChatGifAttachment? = nil, recipient: String? = nil, replyTo: ChatReplyPreview? = nil) {
+    init(
+        content: String,
+        gif: ChatGifAttachment? = nil,
+        image: ChatImageAttachment? = nil,
+        recipient: String? = nil,
+        replyTo: ChatReplyPreview? = nil
+    ) {
         self.content = content
         self.gif = gif
+        self.image = image
         self.recipient = recipient
         self.replyTo = replyTo
     }
+}
+
+/// Ack payload of `chat:imageUploadAuthorize` (meeting-core): a short-lived
+/// bearer token plus the asset endpoint to POST the raw image bytes to.
+struct ChatImageUploadAuthorization: Codable {
+    let token: String
+    let uploadUrl: String
+    let maxBytes: Int
 }
 
 struct ConclaveAuthorizeRequest: Codable {
@@ -1172,6 +1188,7 @@ struct ChatMessageNotification: Codable {
     let content: String
     let timestamp: Double
     let gif: ChatGifAttachment?
+    let image: ChatImageAttachment?
     // DM fields (meeting-core ChatMessage) - present only on direct messages.
     let isDirect: Bool?
     let dmTargetUserId: String?
@@ -1206,6 +1223,7 @@ extension ChatMessageNotification {
             content: content,
             timestamp: Date(timeIntervalSince1970: timestamp / 1000),
             gif: gif,
+            image: image,
             isDirect: isDirect ?? false,
             dmTargetUserId: dmTargetUserId,
             dmTargetDisplayName: dmTargetDisplayName,

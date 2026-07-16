@@ -154,8 +154,11 @@ final class SocketIOManager {
     func toggleCamera(producerId: String, paused: Bool) async throws { }
     func closeProducer(producerId: String) async throws { }
 
-    func sendChat(content: String, gif: ChatGifAttachment? = nil, recipient: String? = nil, replyTo: ChatReplyPreview? = nil) async throws -> ChatMessage {
-        ChatMessage(userId: "local", displayName: "You", content: content, gif: gif)
+    func sendChat(content: String, gif: ChatGifAttachment? = nil, image: ChatImageAttachment? = nil, recipient: String? = nil, replyTo: ChatReplyPreview? = nil) async throws -> ChatMessage {
+        ChatMessage(userId: "local", displayName: "You", content: content, gif: gif, image: image)
+    }
+    func authorizeChatImageUpload() async throws -> ChatImageUploadAuthorization {
+        throw NSError(domain: "Conclave", code: -1, userInfo: [NSLocalizedDescriptionKey: "SocketIO not available on macOS"])
     }
     func requestConclaveAuthorization(answerId: String, questionMessageId: String) async throws -> ConclaveAuthorizeResponse {
         throw NSError(domain: "Conclave", code: -1, userInfo: [NSLocalizedDescriptionKey: "SocketIO not available on macOS"])

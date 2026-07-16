@@ -159,6 +159,25 @@ adb logcat -d | grep setRequestedFrameRate
 The expected idle state in a meeting is not constant 60 fps redraws. Lottie
 will animate during entry, but it must be removed after reveal.
 
+## Connection Recovery Watchdog
+
+The reconnect state machine (onDisconnected → reconnecting → rejoin) is driven
+by fire-and-forget tasks with in-flight guards (`isRejoinInFlight`,
+`shouldRejoinAfterReconnect`, attempt-id checks). Overlapping triggers can
+strand it: a superseded join attempt bails on its attempt-id guard without
+resetting the flags, after which every recovery entry point is guard-blocked.
+Reproduced 2026-07-14 on the simulator: ~16 min idle in a quiet room, then a
+permanent "Connection interrupted" banner; even background/foreground could
+not restart recovery.
+
+`ConnectionRecoveryWatchdogPolicy` (Models.swift, unit-tested) is the
+backstop, same philosophy as the entry overlay: pure policy over observable
+timestamps. `beginConnectionRecovery` stamps `recoveryStartedAt` and starts a
+tick; a stall (no join activity for 25 s) force-resets the guards and rejoins
+fresh; passing the 120 s hard cap fails out to the error screen with a retry.
+Do not add new recovery entry points that only honor the in-flight flags -
+stamp `lastJoinActivityAt` on real progress and let the watchdog break ties.
+
 ## Entry Overlay
 
 The meeting-entry overlay is there to hide connection/setup churn. It should
@@ -275,6 +294,61 @@ Sheet rules:
 
 For iOS, keep the standard SwiftUI sheet path. Do not force Android sheet
 bridges into iOS.
+
+## Appearance-Callback Render Loop (100% CPU, 0x8BADF00D)
+
+Proven on iOS sim 2026-07-17 while landing chat images. `onAppear`/`onDisappear`
+closures are re-merged and can RE-FIRE whenever the owning body re-runs (the
+profile shows `_AppearanceActionModifier.MergedBox.update()` invoking them). If
+such a callback writes `@State`, the write re-invalidates body, which re-fires
+the callback: the view spins at 100% CPU forever. Symptoms: XCUITest/agent-device
+"Daemon request timed out" (the app never reaches quiescence), frozen mid
+transition screenshots, and - if the app then backgrounds - a FrontBoard
+watchdog kill (`0x8BADF00D` "exhausted CPU time allowance", visible in
+`~/Library/Logs/DiagnosticReports`).
+
+Rules:
+
+- Appearance callbacks must not write observed view state. Track high-churn
+  flags (scroll sentinels, visibility latches) in a plain reference box held in
+  `@State` (`ChatBottomSentinelBox` in ChatViews.swift): mutating a field does
+  not invalidate, and event handlers (onChange) read it on demand.
+- Any @State write an appearance callback must make (e.g. clearing the unseen
+  pill) must be value-guarded so it is a no-op almost always.
+- Rows whose height depends on async load phase (AsyncImage placeholder vs
+  loaded) must reserve a FIXED frame for every phase. LazyVStack evicts row
+  state off-screen, so phase-sized frames make content height oscillate, which
+  re-solves bottom-anchored scrolls and re-toggles sentinels.
+- Diagnose with `sample <pid> 5 -file out.txt`: the repeating body getter and
+  `StoredLocationBase.set` under `AppearanceActionModifier` name the writer.
+
+## Socket Ack Shapes (server `(_data, callback)` vs `(callback)`)
+
+SFU handlers come in two shapes and each needs the matching client emit:
+
+- `(callback) => {}` (e.g. getProducers): emit ack-only, NO payload
+  (`emitAckOnly`). A `{}` payload would bind to `callback`.
+- `(_data, callback) => {}` (e.g. `chat:imageUploadAuthorize`): emit an EMPTY
+  `{}` payload (`emit(event, EmptySocketPayload())` / Kotlin
+  `emit(event, JSONObject())`). Ack-only binds the ack fn to `_data`, the
+  server answers a callback that does not exist, and the client times out
+  after 30s - surfaced as a generic failure, so check this FIRST when a new
+  ack round-trip "has no connection".
+
+Check the handler signature in `packages/sfu/server/socket/handlers/` before
+wiring any new ack event.
+
+## Chat Message Reconstruction Sites
+
+`ChatMessage` gets REBUILT (not copied) in several places; a new field with an
+init default silently vanishes at any site that omits it. When adding a field
+(gif, image, replyTo, ...), update ALL of: `normalizedChatMessage` (both
+branches), `refreshChatDisplayName`, `mergedConclaveAssistantMessage`,
+`appendOptimisticChatMessage` in MeetingViewModel.swift; the Kotlin decoders
+`decodeChatMessageObject` / `decodeChatReplyPreviewObject` /
+`decodeConclaveAssistantMessage` in SocketIOManager+Android.kt (hand-rolled
+JSON, NOT transpiled); and the test fixtures. The image field was dropped by
+`normalizedChatMessage` on every receive until 2026-07-17.
 
 ## Android `onChange` Crash Pattern
 

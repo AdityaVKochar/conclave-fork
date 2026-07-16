@@ -152,6 +152,8 @@ final class MeetingState {
     var isNoGuests: Bool = false
     var isDmEnabled: Bool = true
     var isImageAttachmentsEnabled: Bool = true
+    // True while a picked chat image is uploading to the asset store.
+    var isChatImageUploading: Bool = false
     var isTtsDisabled: Bool = false
     var isReactionsDisabled: Bool = false
     var meetingRequiresInviteCode: Bool = false

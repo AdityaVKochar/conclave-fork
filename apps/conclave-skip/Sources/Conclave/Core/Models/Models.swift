@@ -13,6 +13,59 @@ enum ConnectionState: String, Equatable {
     case error
 }
 
+/// Backstop for the reconnect state machine. Recovery is driven by
+/// fire-and-forget tasks, and overlapping triggers can strand it: a superseded
+/// join attempt bails on its attempt-id guard without resetting
+/// `isRejoinInFlight`, after which every recovery entry point
+/// (`rejoinIfPossible`, `forceRejoinWithFreshToken`, foreground recovery) is
+/// guard-blocked while the user stares at the "Connection interrupted" banner
+/// forever. Reproduced on 2026-07-14: ~16 min idle on the simulator, then
+/// stuck; even a background/foreground cycle could not restart recovery.
+///
+/// The watchdog is pure policy over observable state, in the same spirit as
+/// `MeetingEntryOverlayPolicy`: a stalled recovery forces a fresh rejoin
+/// cycle, and a recovery that exceeds the hard cap surfaces a terminal error
+/// instead of an endless banner.
+enum ConnectionRecoveryWatchdogPolicy {
+    /// Recovery with no join-attempt progress for this long forces a fresh
+    /// rejoin (long enough for a full token fetch + connect + join round).
+    static let stallSeconds: Double = 25.0
+    /// Total time a single recovery may run before giving up into the error
+    /// screen with a retry affordance.
+    static let hardCapSeconds: Double = 120.0
+    /// Watchdog evaluation cadence.
+    static let tickSeconds: Double = 8.0
+
+    enum Action: String, Equatable {
+        /// Recovery is progressing (or over); do nothing this tick.
+        case wait
+        /// Recovery looks stranded; reset the in-flight guards and rejoin.
+        case forceRejoin
+        /// Recovery has run past the hard cap; fail out to the error screen.
+        case fail
+        /// Recovery finished (joined / terminal state); stop the watchdog.
+        case standDown
+    }
+
+    static func action(
+        secondsSinceRecoveryStarted: Double,
+        secondsSinceLastJoinActivity: Double,
+        connectionState: ConnectionState,
+        isIntentionalLeave: Bool
+    ) -> Action {
+        if isIntentionalLeave { return .standDown }
+        switch connectionState {
+        case .joined, .waiting, .error, .disconnected:
+            return .standDown
+        case .connecting, .connected, .joining, .reconnecting:
+            break
+        }
+        if secondsSinceRecoveryStarted >= hardCapSeconds { return .fail }
+        if secondsSinceLastJoinActivity >= stallSeconds { return .forceRejoin }
+        return .wait
+    }
+}
+
 enum AdminNoticeLevel: String, Equatable {
     case info
     case warning
@@ -188,8 +241,93 @@ struct ChatReplyPreview: Codable, Equatable {
     let displayName: String
     let content: String
     let hasGif: Bool
+    var hasImage: Bool? = nil
     let isDirect: Bool?
     let dmTargetUserId: String?
+}
+
+/// An uploaded chat image (meeting-core ChatImageAttachment). The URL points
+/// at the SFU's moderated asset store; clients render it directly.
+struct ChatImageAttachment: Codable, Equatable {
+    let id: String
+    let url: String
+    let fileName: String
+    let mimeType: String
+    let size: Int
+}
+
+/// Body of the asset-store upload response.
+struct ChatImageUploadResult: Codable {
+    let image: ChatImageAttachment?
+    let code: String?
+    let error: String?
+}
+
+struct ChatImageUploadError: Error {
+    let message: String
+}
+
+/// Client-side validation for outgoing chat images, mirroring the web's
+/// chat-images.ts (6 MB cap, sniffed mime types, moderation-blocked code).
+enum ChatImageSendPolicy {
+    static let maxBytes = 6 * 1024 * 1024
+    static let moderationBlockedCode = "moderation_blocked"
+
+    static func isAcceptableSize(_ byteCount: Int) -> Bool {
+        byteCount > 0 && byteCount <= maxBytes
+    }
+
+    /// Sniffs the actual bytes rather than trusting a picker's file extension.
+    static func mimeType(forData data: Data) -> String? {
+        // Direct Data indexing: both Array(data.prefix(N)) and iterating a
+        // Data prefix fail Skip's Kotlin transpile; subscripting works on
+        // both platforms (this Data always starts at index 0).
+        guard data.count >= 12 else { return nil }
+        var header: [UInt8] = []
+        var index = 0
+        while index < 12 {
+            header.append(data[index])
+            index += 1
+        }
+        if header[0] == UInt8(0x89), header[1] == UInt8(0x50), header[2] == UInt8(0x4E), header[3] == UInt8(0x47) {
+            return "image/png"
+        }
+        if header[0] == UInt8(0xFF), header[1] == UInt8(0xD8), header[2] == UInt8(0xFF) {
+            return "image/jpeg"
+        }
+        if header[0] == UInt8(0x47), header[1] == UInt8(0x49), header[2] == UInt8(0x46) {
+            return "image/gif"
+        }
+        if header[0] == UInt8(0x52), header[1] == UInt8(0x49), header[2] == UInt8(0x46), header[3] == UInt8(0x46),
+           header[8] == UInt8(0x57), header[9] == UInt8(0x45), header[10] == UInt8(0x42), header[11] == UInt8(0x50) {
+            return "image/webp"
+        }
+        if header[4] == UInt8(0x66), header[5] == UInt8(0x74), header[6] == UInt8(0x79), header[7] == UInt8(0x70),
+           header[8] == UInt8(0x61), header[9] == UInt8(0x76), header[10] == UInt8(0x69), header[11] == UInt8(0x66) {
+            return "image/avif"
+        }
+        return nil
+    }
+
+    /// A stable upload name with an extension matching the sniffed type, so
+    /// the asset store never sees a picker's placeholder or .heic name on
+    /// re-encoded bytes.
+    static func uploadFileName(originalName: String, mimeType: String) -> String {
+        let ext: String
+        switch mimeType {
+        case "image/png": ext = "png"
+        case "image/gif": ext = "gif"
+        case "image/webp": ext = "webp"
+        case "image/avif": ext = "avif"
+        default: ext = "jpg"
+        }
+        let base = originalName
+            .split(separator: ".")
+            .first
+            .map { String($0) } ?? "photo"
+        let safeBase = base.isEmpty ? "photo" : base
+        return "\(safeBase).\(ext)"
+    }
 }
 
 struct ChatGifAttachment: Codable, Equatable {
@@ -250,6 +388,7 @@ struct ChatMessage: Identifiable, Equatable {
     let content: String
     let timestamp: Date
     let gif: ChatGifAttachment?
+    let image: ChatImageAttachment?
     // Direct-message metadata (web chat parity). Set only on private messages.
     let isDirect: Bool
     let dmTargetUserId: String?
@@ -264,6 +403,7 @@ struct ChatMessage: Identifiable, Equatable {
         content: String,
         timestamp: Date = Date(),
         gif: ChatGifAttachment? = nil,
+        image: ChatImageAttachment? = nil,
         isDirect: Bool = false,
         dmTargetUserId: String? = nil,
         dmTargetDisplayName: String? = nil,
@@ -276,6 +416,7 @@ struct ChatMessage: Identifiable, Equatable {
         self.content = content
         self.timestamp = timestamp
         self.gif = gif
+        self.image = image
         self.isDirect = isDirect
         self.dmTargetUserId = dmTargetUserId
         self.dmTargetDisplayName = dmTargetDisplayName

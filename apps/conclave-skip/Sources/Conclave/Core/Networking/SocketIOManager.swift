@@ -940,14 +940,26 @@ final class SocketIOManager {
 
     // MARK: - Chat
 
-    func sendChat(content: String, gif: ChatGifAttachment? = nil, recipient: String? = nil, replyTo: ChatReplyPreview? = nil) async throws -> ChatMessage {
-        let request = SendChatRequest(content: content, gif: gif, recipient: recipient, replyTo: replyTo)
+    func sendChat(content: String, gif: ChatGifAttachment? = nil, image: ChatImageAttachment? = nil, recipient: String? = nil, replyTo: ChatReplyPreview? = nil) async throws -> ChatMessage {
+        let request = SendChatRequest(content: content, gif: gif, image: image, recipient: recipient, replyTo: replyTo)
         let data = try await emit(event: SocketEvent.sendChat, payload: request)
         let response = try JSONDecoder().decode(SendChatResponse.self, from: data)
         guard let message = response.message else {
             throw SocketError.serverError("Missing chat message acknowledgement.")
         }
         return message.chatMessage(taggedRoomId: activeRoomId)
+    }
+
+    /// Asks the SFU for a short-lived upload slot for a chat image; the bytes
+    /// are then POSTed to `uploadUrl` with the bearer token (see
+    /// MeetingViewModel.sendChatImageAttachment).
+    func authorizeChatImageUpload() async throws -> ChatImageUploadAuthorization {
+        // The server handler is `(_data, callback)`, so a real (empty) payload
+        // must fill the first slot - an ack-only emit binds the ack function to
+        // `_data` and the callback never fires (mirror of the getProducers
+        // gotcha above, in the other direction).
+        let data = try await emit(event: SocketEvent.chatImageUploadAuthorize, payload: EmptySocketPayload())
+        return try JSONDecoder().decode(ChatImageUploadAuthorization.self, from: data)
     }
 
     func requestConclaveAuthorization(answerId: String, questionMessageId: String) async throws -> ConclaveAuthorizeResponse {
@@ -1529,6 +1541,10 @@ final class SocketIOManager {
             }
         }
     }
+
+    /// Empty `{}` payload for handlers declared `(_data, callback)` that carry
+    /// no request fields but still need the first argument slot filled.
+    struct EmptySocketPayload: Encodable {}
 
     func emit<T: Encodable>(
         event: String,

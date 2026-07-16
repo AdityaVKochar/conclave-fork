@@ -146,6 +146,69 @@ final class ConclaveTests: XCTestCase {
         XCTAssertNil(ordinaryObject["webcamReceiverCapacityTransition"])
     }
 
+    func testConnectionRecoveryWatchdogPolicyActions() {
+        // Progressing recovery: recent join activity keeps the watchdog quiet.
+        XCTAssertEqual(
+            ConnectionRecoveryWatchdogPolicy.action(
+                secondsSinceRecoveryStarted: 10,
+                secondsSinceLastJoinActivity: 5,
+                connectionState: ConnectionState.reconnecting,
+                isIntentionalLeave: false
+            ),
+            ConnectionRecoveryWatchdogPolicy.Action.wait
+        )
+        // Stranded recovery: no join activity past the stall threshold forces
+        // a fresh rejoin even while the state still claims to be joining.
+        XCTAssertEqual(
+            ConnectionRecoveryWatchdogPolicy.action(
+                secondsSinceRecoveryStarted: 40,
+                secondsSinceLastJoinActivity: 30,
+                connectionState: ConnectionState.joining,
+                isIntentionalLeave: false
+            ),
+            ConnectionRecoveryWatchdogPolicy.Action.forceRejoin
+        )
+        // Hard cap wins over another force cycle.
+        XCTAssertEqual(
+            ConnectionRecoveryWatchdogPolicy.action(
+                secondsSinceRecoveryStarted: 121,
+                secondsSinceLastJoinActivity: 26,
+                connectionState: ConnectionState.reconnecting,
+                isIntentionalLeave: false
+            ),
+            ConnectionRecoveryWatchdogPolicy.Action.fail
+        )
+        // Reaching a settled or terminal state stands the watchdog down.
+        XCTAssertEqual(
+            ConnectionRecoveryWatchdogPolicy.action(
+                secondsSinceRecoveryStarted: 40,
+                secondsSinceLastJoinActivity: 40,
+                connectionState: ConnectionState.joined,
+                isIntentionalLeave: false
+            ),
+            ConnectionRecoveryWatchdogPolicy.Action.standDown
+        )
+        XCTAssertEqual(
+            ConnectionRecoveryWatchdogPolicy.action(
+                secondsSinceRecoveryStarted: 40,
+                secondsSinceLastJoinActivity: 40,
+                connectionState: ConnectionState.error,
+                isIntentionalLeave: false
+            ),
+            ConnectionRecoveryWatchdogPolicy.Action.standDown
+        )
+        // An intentional leave always stands down, whatever the timers say.
+        XCTAssertEqual(
+            ConnectionRecoveryWatchdogPolicy.action(
+                secondsSinceRecoveryStarted: 500,
+                secondsSinceLastJoinActivity: 500,
+                connectionState: ConnectionState.reconnecting,
+                isIntentionalLeave: true
+            ),
+            ConnectionRecoveryWatchdogPolicy.Action.standDown
+        )
+    }
+
     func testTranscriptPresentationPolicyOrdersAndGroupsSegments() throws {
         let unordered = [
             TranscriptSegmentModel(itemId: "b", sequence: 2, speakerUserId: "alex", speakerDisplayName: "Alex", text: "later", startMs: 3_000, isFinal: true),
@@ -5063,6 +5126,7 @@ final class ConclaveTests: XCTestCase {
                     content: "old history",
                     timestamp: 1_000,
                     gif: nil,
+                    image: nil,
                     isDirect: false,
                     dmTargetUserId: nil,
                     dmTargetDisplayName: nil,
@@ -5081,6 +5145,7 @@ final class ConclaveTests: XCTestCase {
                     content: "latest history",
                     timestamp: 2_000,
                     gif: nil,
+                    image: nil,
                     isDirect: false,
                     dmTargetUserId: nil,
                     dmTargetDisplayName: nil,
@@ -5125,6 +5190,7 @@ final class ConclaveTests: XCTestCase {
                     content: "later",
                     timestamp: 3_000,
                     gif: nil,
+                    image: nil,
                     isDirect: false,
                     dmTargetUserId: nil,
                     dmTargetDisplayName: nil,
@@ -5138,6 +5204,7 @@ final class ConclaveTests: XCTestCase {
                     content: "duplicate",
                     timestamp: 4_000,
                     gif: nil,
+                    image: nil,
                     isDirect: false,
                     dmTargetUserId: nil,
                     dmTargetDisplayName: nil,
@@ -5151,6 +5218,7 @@ final class ConclaveTests: XCTestCase {
                     content: "private",
                     timestamp: 1_000,
                     gif: nil,
+                    image: nil,
                     isDirect: true,
                     dmTargetUserId: "someone-else@example.com#session",
                     dmTargetDisplayName: nil,
@@ -5170,6 +5238,7 @@ final class ConclaveTests: XCTestCase {
                     content: "stale",
                     timestamp: 5_000,
                     gif: nil,
+                    image: nil,
                     isDirect: false,
                     dmTargetUserId: nil,
                     dmTargetDisplayName: nil,
@@ -5201,6 +5270,7 @@ final class ConclaveTests: XCTestCase {
                     content: "/tts\thello world",
                     timestamp: 3_000,
                     gif: nil,
+                    image: nil,
                     isDirect: false,
                     dmTargetUserId: nil,
                     dmTargetDisplayName: nil,
