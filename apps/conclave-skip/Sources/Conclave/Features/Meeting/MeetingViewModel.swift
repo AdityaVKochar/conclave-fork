@@ -7034,6 +7034,7 @@ final class MeetingViewModel {
         isDisplayNameUpdateInFlight = false
         adminActionsInFlight.removeAll()
         state.chatMessages.removeAll()
+        state.isChatImageUploading = false
         pendingOptimisticChatSends.removeAll()
         clearChatOverlayMessages()
         clearReactions()
@@ -8629,68 +8630,83 @@ final class MeetingViewModel {
     /// sends it as a chat attachment with the caption (mirrors the web's
     /// sendChatImage: authorize -> bearer POST -> send). Size/type limits and
     /// error copy match the web client.
-    func sendChatImage(fileURL: URL, caption: String, replyTo: ChatReplyPreview? = nil) {
+    /// Uploads and sends a chat image. Returns true when the message went out;
+    /// false lets the composer restore the caption/reply it staged.
+    @discardableResult
+    func sendChatImage(fileURL: URL, caption: String, replyTo: ChatReplyPreview? = nil) async -> Bool {
         guard state.connectionState == .joined else {
             state.errorMessage = "Reconnect before sending chat."
-            return
+            return false
         }
-        guard !state.isWebinarAttendee else { return }
+        guard !state.isWebinarAttendee else { return false }
         if state.isChatLocked && !state.isAdmin {
             addSystemMessage(.info("Chat is locked by the host."))
-            return
+            return false
         }
         guard state.isImageAttachmentsEnabled else {
             addSystemMessage(.info("Image attachments are disabled by the host."))
-            return
+            return false
         }
-        guard !state.isChatImageUploading else { return }
+        guard !state.isChatImageUploading else { return false }
 
         let trimmedCaption = caption.trimmingCharacters(in: .whitespacesAndNewlines)
         let actionContext = currentCallActionContext()
         state.isChatImageUploading = true
+        defer { state.isChatImageUploading = false }
 
-        Task { @MainActor [weak self] in
-            guard let self else { return }
-            defer { self.state.isChatImageUploading = false }
-            do {
-                let data = try Data(contentsOf: fileURL)
-                guard let mimeType = ChatImageSendPolicy.mimeType(forData: data) else {
-                    self.addSystemMessage(.info("That image type isn't supported. Use JPEG, PNG, GIF, or WebP."))
-                    return
-                }
-                guard ChatImageSendPolicy.isAcceptableSize(data.count) else {
-                    self.addSystemMessage(.info("Images can be up to 6 MB."))
-                    return
-                }
-                let authorization = try await self.socketManager.authorizeChatImageUpload()
-                guard data.count <= authorization.maxBytes else {
-                    self.addSystemMessage(.info("Images can be up to 6 MB."))
-                    return
-                }
-                let fileName = ChatImageSendPolicy.uploadFileName(
-                    originalName: fileURL.lastPathComponent,
-                    mimeType: mimeType
-                )
-                let image = try await self.uploadChatImage(
-                    data: data,
-                    fileName: fileName,
-                    mimeType: mimeType,
-                    authorization: authorization
-                )
-                guard self.isCurrentJoinedCall(actionContext) else { return }
-                _ = try await self.sendChatContentOptimistically(
-                    trimmedCaption,
-                    image: image,
-                    replyTo: replyTo,
-                    context: actionContext
-                )
-            } catch let error as ChatImageUploadError {
-                guard self.isCurrentJoinedCall(actionContext) else { return }
-                self.addSystemMessage(.info(error.message))
-            } catch {
-                guard self.isCurrentJoinedCall(actionContext) else { return }
-                self.addSystemMessage(.info("Image upload failed. Check your connection."))
+        do {
+            // Reject oversized files from metadata BEFORE reading the bytes: a
+            // picker result can be tens of megabytes, and reading it first
+            // would buffer it all just to throw it away.
+            if let attributeSize = try? FileManager.default.attributesOfItem(atPath: fileURL.path)[FileAttributeKey.size],
+               let declaredByteCount = attributeSize as? Int,
+               declaredByteCount > 0,
+               !ChatImageSendPolicy.isAcceptableSize(declaredByteCount) {
+                addSystemMessage(.info("Images can be up to 6 MB."))
+                return false
             }
+            let data = try await Task.detached(priority: .userInitiated) {
+                try Data(contentsOf: fileURL)
+            }.value
+            guard let mimeType = ChatImageSendPolicy.mimeType(forData: data) else {
+                addSystemMessage(.info("That image type isn't supported. Use JPEG, PNG, GIF, or WebP."))
+                return false
+            }
+            guard ChatImageSendPolicy.isAcceptableSize(data.count) else {
+                addSystemMessage(.info("Images can be up to 6 MB."))
+                return false
+            }
+            let authorization = try await socketManager.authorizeChatImageUpload()
+            guard data.count <= authorization.maxBytes else {
+                addSystemMessage(.info("Images can be up to 6 MB."))
+                return false
+            }
+            let fileName = ChatImageSendPolicy.uploadFileName(
+                originalName: fileURL.lastPathComponent,
+                mimeType: mimeType
+            )
+            let image = try await uploadChatImage(
+                data: data,
+                fileName: fileName,
+                mimeType: mimeType,
+                authorization: authorization
+            )
+            guard isCurrentJoinedCall(actionContext) else { return false }
+            _ = try await sendChatContentOptimistically(
+                trimmedCaption,
+                image: image,
+                replyTo: replyTo,
+                context: actionContext
+            )
+            return true
+        } catch let error as ChatImageUploadError {
+            guard isCurrentJoinedCall(actionContext) else { return false }
+            addSystemMessage(.info(error.message))
+            return false
+        } catch {
+            guard isCurrentJoinedCall(actionContext) else { return false }
+            addSystemMessage(.info("Image upload failed. Check your connection."))
+            return false
         }
     }
 

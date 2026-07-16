@@ -322,6 +322,11 @@ Rules:
 - Diagnose with `sample <pid> 5 -file out.txt`: the repeating body getter and
   `StoredLocationBase.set` under `AppearanceActionModifier` name the writer.
 
+Known deferred caveat: SkipUI `AsyncImage` on Android decodes at Coil
+`Size.ORIGINAL` (no downsampling), so a 6 MB high-resolution chat image can
+decode into a very large bitmap. Verify memory on a real Android device; if it
+is a problem, bridge a bounded-size Coil request.
+
 ## Socket Ack Shapes (server `(_data, callback)` vs `(callback)`)
 
 SFU handlers come in two shapes and each needs the matching client emit:

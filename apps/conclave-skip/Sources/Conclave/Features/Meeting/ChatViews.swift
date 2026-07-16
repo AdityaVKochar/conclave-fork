@@ -605,7 +605,15 @@ private struct ChatComposerView: View {
         replyTarget = nil
         messageText = ""
         HapticManager.shared.trigger(.light)
-        viewModel.sendChatImage(fileURL: url, caption: caption, replyTo: activeReply)
+        Task {
+            let sent = await viewModel.sendChatImage(fileURL: url, caption: caption, replyTo: activeReply)
+            // A failed upload should not eat the user's draft: put the caption
+            // and reply back unless they already started something new.
+            if !sent {
+                if messageText.isEmpty { messageText = caption }
+                if replyTarget == nil { replyTarget = activeReply }
+            }
+        }
     }
 
     private func sendGif(_ gif: ChatGifAttachment) {
@@ -1969,24 +1977,38 @@ struct ChatImageMessageView: View {
         } label: {
             VStack(alignment: .leading, spacing: 0) {
                 if let imageURL {
-                    // Fixed-size stage for every load phase. The bubble's
+                    // Fixed-HEIGHT stage for every load phase. The bubble's
                     // height must NOT depend on whether the bitmap has loaded:
                     // LazyVStack evicts row state off-screen, so phase-sized
                     // frames make content height oscillate, which re-solves the
                     // bottom-anchored scroll, re-toggles the sentinel, and
                     // spins the timeline at 100% CPU until the watchdog kills
-                    // the app (0x8BADF00D, seen 2026-07-17).
+                    // the app (0x8BADF00D, seen 2026-07-17). Width flexes up to
+                    // 280 so compact panels never clip the row; Color.clear
+                    // keeps the stage greedy while the spinner shows.
                     ZStack {
-                        AsyncImage(url: imageURL) { loaded in
-                            loaded
-                                .resizable()
-                                .scaledToFit()
-                        } placeholder: {
-                            ProgressView()
-                                .tint(ACMColors.primaryOrange)
+                        Color.clear
+                        AsyncImage(url: imageURL) { phase in
+                            if let loaded = phase.image {
+                                loaded
+                                    .resizable()
+                                    .scaledToFit()
+                            } else if phase.error != nil {
+                                VStack(spacing: 6) {
+                                    ACMSystemIcon.icon("photo.badge.exclamationmark", android: "warning", size: 22)
+                                        .foregroundStyle(ACMColors.textFaint)
+                                    Text("Couldn't load image")
+                                        .font(ACMFont.trial(12))
+                                        .foregroundStyle(ACMColors.textMuted)
+                                }
+                            } else {
+                                ProgressView()
+                                    .tint(ACMColors.primaryOrange)
+                            }
                         }
                     }
-                    .frame(width: 280, height: 220)
+                    .frame(maxWidth: 280)
+                    .frame(height: 220)
                 }
                 if !caption.isEmpty {
                     Text(caption)

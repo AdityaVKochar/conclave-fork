@@ -940,7 +940,7 @@ internal class SocketIOManager {
         // the ack callback binds to the second slot (ack-only emits never get
         // answered by this handler).
         val data = emit(SocketEvent.chatImageUploadAuthorize, JSONObject())
-        return JSONDecoder().decode(ChatImageUploadAuthorization::class, from = data)
+        return JSONDecoder().decode(ChatImageUploadAuthorizationAck::class, from = data).authorization()
     }
 
     internal suspend fun requestConclaveAuthorization(

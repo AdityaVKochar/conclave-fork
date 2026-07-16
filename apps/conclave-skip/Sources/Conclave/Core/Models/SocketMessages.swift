@@ -188,6 +188,27 @@ struct ChatImageUploadAuthorization: Codable {
     let maxBytes: Int
 }
 
+/// Raw `chat:imageUploadAuthorize` ack. The server answers EITHER the grant
+/// fields or `{error}` (rate limit, host policy, watch-only); decoding through
+/// this and calling `authorization()` surfaces the server's message instead of
+/// a generic connection error.
+struct ChatImageUploadAuthorizationAck: Codable {
+    let token: String?
+    let uploadUrl: String?
+    let maxBytes: Int?
+    let error: String?
+
+    func authorization() throws -> ChatImageUploadAuthorization {
+        if let error, !error.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            throw ChatImageUploadError(message: error)
+        }
+        guard let token, let uploadUrl, let maxBytes else {
+            throw ChatImageUploadError(message: "Image upload is unavailable right now.")
+        }
+        return ChatImageUploadAuthorization(token: token, uploadUrl: uploadUrl, maxBytes: maxBytes)
+    }
+}
+
 struct ConclaveAuthorizeRequest: Codable {
     let id: String
     let questionMessageId: String

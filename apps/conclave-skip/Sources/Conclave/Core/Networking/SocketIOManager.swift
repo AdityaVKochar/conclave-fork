@@ -959,7 +959,7 @@ final class SocketIOManager {
         // `_data` and the callback never fires (mirror of the getProducers
         // gotcha above, in the other direction).
         let data = try await emit(event: SocketEvent.chatImageUploadAuthorize, payload: EmptySocketPayload())
-        return try JSONDecoder().decode(ChatImageUploadAuthorization.self, from: data)
+        return try JSONDecoder().decode(ChatImageUploadAuthorizationAck.self, from: data).authorization()
     }
 
     func requestConclaveAuthorization(answerId: String, questionMessageId: String) async throws -> ConclaveAuthorizeResponse {

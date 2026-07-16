@@ -271,7 +271,7 @@ struct ChatImageUploadError: Error {
 /// chat-images.ts (6 MB cap, sniffed mime types, moderation-blocked code).
 enum ChatImageSendPolicy {
     static let maxBytes = 6 * 1024 * 1024
-    static let moderationBlockedCode = "moderation_blocked"
+    static let moderationBlockedCode = "chat_image_moderation_blocked"
 
     static func isAcceptableSize(_ byteCount: Int) -> Bool {
         byteCount > 0 && byteCount <= maxBytes
