@@ -2347,7 +2347,14 @@ export default function MeetsClient({
 
   useEffect(() => {
     if (viewSettings.audioOnlyMode && !isCameraOff) void toggleCamera();
-  }, [isCameraOff, toggleCamera, viewSettings.audioOnlyMode]);
+    if (viewSettings.audioOnlyMode && isScreenSharing) void toggleScreenShare();
+  }, [
+    isCameraOff,
+    isScreenSharing,
+    toggleCamera,
+    toggleScreenShare,
+    viewSettings.audioOnlyMode,
+  ]);
 
   useEffect(() => {
     ensureProducerTransportRef.current = socket.ensureProducerTransport;

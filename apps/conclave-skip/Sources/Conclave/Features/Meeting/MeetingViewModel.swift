@@ -579,6 +579,7 @@ final class MeetingViewModel {
     private var localAudioProducerReplacementToken: UUID?
     private var isCameraToggleInFlight = false
     private var isScreenShareToggleInFlight = false
+    private var videoPublishingPolicyRevision = 0
     private var isHandRaiseToggleInFlight = false
     private var isDisplayNameUpdateInFlight = false
     private var isCameraSwitchInFlight = false
@@ -7265,6 +7266,7 @@ final class MeetingViewModel {
               !isCameraToggleInFlight else { return }
         let actionRoomId = state.roomId
         let actionJoinAttemptId = activeJoinAttemptId
+        let actionVideoPolicyRevision = videoPublishingPolicyRevision
         isCameraToggleInFlight = true
         let newState = !state.isCameraOff
         setLocalCameraOffState(newState, syncCallPresence: newState)
@@ -7283,6 +7285,13 @@ final class MeetingViewModel {
                     await webRTCClient.closeLocalVideoProducer()
                 } else {
                     try await enableOrStartLocalVideo()
+                    guard isCurrentJoinedCall(roomId: actionRoomId, joinAttemptId: actionJoinAttemptId) else { return }
+                    guard actionVideoPolicyRevision == videoPublishingPolicyRevision,
+                          !state.isAudioOnlyMode else {
+                        await webRTCClient.closeLocalVideoProducer()
+                        setLocalCameraOffState(true)
+                        return
+                    }
                     setLocalCameraOffState(false)
                 }
             } catch {
@@ -7296,11 +7305,15 @@ final class MeetingViewModel {
     func setAudioOnlyMode(_ enabled: Bool) {
         guard state.isAudioOnlyMode != enabled else { return }
         state.isAudioOnlyMode = enabled
+        videoPublishingPolicyRevision += 1
         if enabled && !state.isCameraOff {
             setLocalCameraOffState(true)
             Task { @MainActor [weak self] in
                 await self?.webRTCClient.closeLocalVideoProducer()
             }
+        }
+        if enabled && state.isScreenSharing {
+            toggleScreenShare()
         }
         scheduleRemoteConsumerBandwidthPolicyUpdate()
     }
@@ -7315,6 +7328,7 @@ final class MeetingViewModel {
 
     func canSwitchLocalCamera() -> Bool {
         state.connectionState == .joined
+            && !state.isAudioOnlyMode
             && !state.mediaPublishingDisabled
             && !isCameraSwitchInFlight
             && webRTCClient.canSwitchCamera()
@@ -7352,6 +7366,7 @@ final class MeetingViewModel {
     func toggleScreenShare() {
         guard state.connectionState == .joined,
               !state.mediaPublishingDisabled,
+              (!state.isAudioOnlyMode || state.isScreenSharing),
               !isScreenShareToggleInFlight else { return }
         if !state.isScreenSharing,
            let activeScreenShareUserId = state.activeScreenShareUserId,
@@ -7361,6 +7376,7 @@ final class MeetingViewModel {
         }
         let actionRoomId = state.roomId
         let actionJoinAttemptId = activeJoinAttemptId
+        let actionVideoPolicyRevision = videoPublishingPolicyRevision
         isScreenShareToggleInFlight = true
         #if canImport(UIKit) && !SKIP
         Task { @MainActor in
@@ -7395,6 +7411,12 @@ final class MeetingViewModel {
                         await ScreenCaptureManager.shared.stopCapture()
                         return
                     }
+                    guard actionVideoPolicyRevision == videoPublishingPolicyRevision,
+                          !state.isAudioOnlyMode else {
+                        ScreenCaptureManager.shared.onBroadcastStopped = nil
+                        await ScreenCaptureManager.shared.stopCapture()
+                        return
+                    }
                     guard ScreenCaptureManager.shared.isCaptureActive else {
                         ScreenCaptureManager.shared.onBroadcastStopped = nil
                         await ScreenCaptureManager.shared.stopCapture()
@@ -7403,6 +7425,8 @@ final class MeetingViewModel {
                     try await webRTCClient.startScreenSharing()
                     let isCurrentCallAfterStart = isCurrentJoinedCall(roomId: actionRoomId, joinAttemptId: actionJoinAttemptId)
                     guard isCurrentCallAfterStart,
+                          actionVideoPolicyRevision == videoPublishingPolicyRevision,
+                          !state.isAudioOnlyMode,
                           ScreenCaptureManager.shared.isCaptureActive else {
                         ScreenCaptureManager.shared.onBroadcastStopped = nil
                         await ScreenCaptureManager.shared.stopCapture()
@@ -7467,6 +7491,14 @@ final class MeetingViewModel {
                     }
                     return
                 }
+                guard actionVideoPolicyRevision == videoPublishingPolicyRevision,
+                      !state.isAudioOnlyMode else {
+                    ScreenCaptureManager.onProjectionRevoked = nil
+                    if granted {
+                        ScreenCaptureManager.stopCapture()
+                    }
+                    return
+                }
                 if granted {
                     do {
                         guard ScreenCaptureManager.isCaptureActive() else {
@@ -7477,6 +7509,8 @@ final class MeetingViewModel {
                         try await webRTCClient.startScreenSharing()
                         let isCurrentCallAfterStart = isCurrentJoinedCall(roomId: actionRoomId, joinAttemptId: actionJoinAttemptId)
                         guard isCurrentCallAfterStart,
+                              actionVideoPolicyRevision == videoPublishingPolicyRevision,
+                              !state.isAudioOnlyMode,
                               ScreenCaptureManager.isCaptureActive() else {
                             ScreenCaptureManager.onProjectionRevoked = nil
                             ScreenCaptureManager.stopCapture()

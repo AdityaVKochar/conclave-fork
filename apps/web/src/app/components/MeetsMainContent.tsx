@@ -2047,7 +2047,6 @@ export default function MeetsMainContent({
             onVideoEffectsChange={onVideoEffectsChange}
             onPrejoinMediaCommit={onPrejoinMediaCommit}
             onEnterStart={onEnterMeetingStart}
-            audioOnlyMode={viewSettings.audioOnlyMode}
           />
         )
       ) : isWebinarAttendee ? (
