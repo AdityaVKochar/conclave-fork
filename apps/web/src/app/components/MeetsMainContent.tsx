@@ -691,6 +691,10 @@ export default function MeetsMainContent({
   const [webinarAudioPlaybackAttempt, setWebinarAudioPlaybackAttempt] = useState(0);
   const [isWebinarQaOpen, setIsWebinarQaOpen] = useState(false);
   const [webinarQaSeenAt, setWebinarQaSeenAt] = useState(0);
+  const isWebinarQaEnabled = webinarConfig?.qaEnabled !== false;
+  useEffect(() => {
+    if (!isWebinarQaEnabled) setIsWebinarQaOpen(false);
+  }, [isWebinarQaEnabled]);
   useEffect(() => {
     if (isWebinarQaOpen) setWebinarQaSeenAt(Date.now());
   }, [isWebinarQaOpen, webinarQaEntries]);
@@ -2205,7 +2209,7 @@ export default function MeetsMainContent({
             attendeeCount={webinarConfig?.attendeeCount ?? 0}
             hasLiveStage={webinarStageIsLive}
             speakerName={webinarStage?.main.displayName ?? null}
-            qaEnabled={webinarConfig?.qaEnabled !== false}
+            qaEnabled={isWebinarQaEnabled}
             isQaOpen={isWebinarQaOpen}
             unseenQaCount={unseenWebinarQaCount}
             onToggleQa={handleToggleWebinarQa}
@@ -2217,14 +2221,16 @@ export default function MeetsMainContent({
             onLeave={leaveRoom}
           />
 
-          {isWebinarQaOpen ? (
+          {isWebinarQaOpen && isWebinarQaEnabled ? (
             <WebinarQaPanel
               entries={webinarQaEntries}
-              qaEnabled={webinarConfig?.qaEnabled !== false}
+              qaEnabled={isWebinarQaEnabled}
               currentUserId={currentUserId}
               onClose={handleToggleWebinarQa}
               onSubmit={onSubmitWebinarQuestion}
-              onUpvote={onUpvoteWebinarQuestion}
+              onUpvote={
+                isWebinarQaEnabled ? onUpvoteWebinarQuestion : undefined
+              }
             />
           ) : null}
 

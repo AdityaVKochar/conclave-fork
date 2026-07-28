@@ -1,3 +1,4 @@
+/** Pure puzzle generation and validation helpers for the Zip game module. */
 export type CellIndex = number;
 export type AnchorMap = Record<CellIndex, number>;
 

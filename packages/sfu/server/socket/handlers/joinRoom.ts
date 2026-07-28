@@ -956,6 +956,7 @@ export const registerJoinRoomHandler = (context: ConnectionContext): void => {
 
         if (
           webinarConfig.scheduledWebinarId &&
+          context.currentClient.isWebinarAttendee &&
           !wasReconnecting &&
           !existingClient
         ) {

@@ -56,6 +56,7 @@ internal object SocketEvent {
     val toggleCamera = SfuClientEvent.toggleCamera.rawValue
     val closeProducer = SfuClientEvent.closeProducer.rawValue
     val sendChat = SfuClientEvent.sendChat.rawValue
+    val chatReact = SfuClientEvent.chatReact.rawValue
     val chatImageUploadAuthorize = SfuClientEvent.chatImageUploadAuthorize.rawValue
     val conclaveAuthorize = SfuClientEvent.conclaveAuthorize.rawValue
     val conclaveAnswer = SfuClientEvent.conclaveAnswer.rawValue
@@ -111,6 +112,13 @@ internal object SocketEvent {
     val webinarUpdateConfig = SfuClientEvent.webinarUpdateConfig.rawValue
     val webinarGenerateLink = SfuClientEvent.webinarGenerateLink.rawValue
     val webinarRotateLink = SfuClientEvent.webinarRotateLink.rawValue
+    val webinarQaSubmit = SfuClientEvent.webinarQaSubmit.rawValue
+    val webinarQaUpvote = SfuClientEvent.webinarQaUpvote.rawValue
+    val webinarQaModerate = SfuClientEvent.webinarQaModerate.rawValue
+    val webinarSetHandRaised = SfuClientEvent.webinarSetHandRaised.rawValue
+    val webinarDeclineStage = SfuClientEvent.webinarDeclineStage.rawValue
+    val webinarPromoteAttendee = SfuClientEvent.webinarPromoteAttendee.rawValue
+    val webinarDemoteParticipant = SfuClientEvent.webinarDemoteParticipant.rawValue
     val browserLaunch = SfuClientEvent.browserLaunch.rawValue
     val browserNavigate = SfuClientEvent.browserNavigate.rawValue
     val browserClose = SfuClientEvent.browserClose.rawValue
@@ -148,6 +156,7 @@ internal object SocketEvent {
     val chatMessage = SfuServerEvent.chatMessage.rawValue
     val conclaveMessage = SfuServerEvent.conclaveMessage.rawValue
     val chatHistorySnapshot = SfuServerEvent.chatHistorySnapshot.rawValue
+    val chatReactionChanged = SfuServerEvent.chatReactionChanged.rawValue
     val reaction = SfuServerEvent.reaction.rawValue
     val handRaised = SfuServerEvent.handRaised.rawValue
     val handRaisedSnapshot = SfuServerEvent.handRaisedSnapshot.rawValue
@@ -189,6 +198,11 @@ internal object SocketEvent {
     val webinarAttendeeCountChanged = SfuServerEvent.webinarAttendeeCountChanged.rawValue
     val webinarFeedChanged = SfuServerEvent.webinarFeedChanged.rawValue
     val webinarParticipantJoined = SfuServerEvent.webinarParticipantJoined.rawValue
+    val webinarQaChanged = SfuServerEvent.webinarQaChanged.rawValue
+    val webinarQaSnapshot = SfuServerEvent.webinarQaSnapshot.rawValue
+    val webinarHandQueueChanged = SfuServerEvent.webinarHandQueueChanged.rawValue
+    val webinarPromoted = SfuServerEvent.webinarPromoted.rawValue
+    val webinarDemoted = SfuServerEvent.webinarDemoted.rawValue
     val browserState = SfuServerEvent.browserState.rawValue
     val browserClosed = SfuServerEvent.browserClosed.rawValue
     val appsState = SfuServerEvent.appsState.rawValue
@@ -262,6 +276,11 @@ internal class SocketIOManager {
     internal var onWebinarAttendeeCountChanged: ((WebinarAttendeeCountChangedNotification) -> Unit)? = null
     internal var onWebinarFeedChanged: ((WebinarFeedChangedNotification) -> Unit)? = null
     internal var onWebinarParticipantJoined: ((WebinarParticipantJoinedNotification) -> Unit)? = null
+    internal var onWebinarQaChanged: ((WebinarQaChangedNotification) -> Unit)? = null
+    internal var onWebinarQaSnapshot: ((WebinarQaSnapshot) -> Unit)? = null
+    internal var onWebinarHandQueueChanged: ((WebinarHandQueueChangedNotification) -> Unit)? = null
+    internal var onWebinarPromoted: ((WebinarPromotedNotification) -> Unit)? = null
+    internal var onWebinarDemoted: ((WebinarDemotedNotification) -> Unit)? = null
     internal var onBrowserState: ((BrowserStateNotification) -> Unit)? = null
     internal var onBrowserClosed: ((BrowserClosedNotification) -> Unit)? = null
     internal var onAppsState: ((AppsStateNotification) -> Unit)? = null
@@ -288,6 +307,7 @@ internal class SocketIOManager {
 
     internal var onChatMessage: ((ChatMessage) -> Unit)? = null
     internal var onChatHistorySnapshot: ((ChatHistorySnapshotNotification) -> Unit)? = null
+    internal var onChatReactionChanged: ((ChatReactionChangedNotification) -> Unit)? = null
     internal var onReaction: ((Reaction) -> Unit)? = null
 
     internal var onHandRaised: ((HandRaisedNotification) -> Unit)? = null
@@ -3306,6 +3326,13 @@ internal class SocketIOManager {
             onChatHistorySnapshot?.invoke(notification)
         })
 
+        socket.on(SocketEvent.chatReactionChanged, Emitter.Listener { args ->
+            if (this.socket !== socket) return@Listener
+            val notification = decode<ChatReactionChangedNotification>(args.firstOrNull()) ?: return@Listener
+            if (!eventRoomIdMatchesActiveOrPending(notification.roomId)) return@Listener
+            onChatReactionChanged?.invoke(notification)
+        })
+
         socket.on(SocketEvent.reaction, Emitter.Listener { args ->
             if (this.socket !== socket) return@Listener
             val notification = decode<ReactionNotification>( args.firstOrNull()) ?: return@Listener
@@ -3598,6 +3625,41 @@ internal class SocketIOManager {
             val notification = decodeWebinarParticipantJoined(args.firstOrNull()) ?: return@Listener
             if (!eventRoomIdMatchesActiveOrPending(notification.roomId)) return@Listener
             onWebinarParticipantJoined?.invoke(notification)
+        })
+
+        socket.on(SocketEvent.webinarQaChanged, Emitter.Listener { args ->
+            if (this.socket !== socket) return@Listener
+            val notification = decode<WebinarQaChangedNotification>(args.firstOrNull()) ?: return@Listener
+            if (!eventRoomIdMatchesActiveOrPending(notification.roomId)) return@Listener
+            onWebinarQaChanged?.invoke(notification)
+        })
+
+        socket.on(SocketEvent.webinarQaSnapshot, Emitter.Listener { args ->
+            if (this.socket !== socket) return@Listener
+            val notification = decode<WebinarQaSnapshot>(args.firstOrNull()) ?: return@Listener
+            if (!eventRoomIdMatchesActiveOrPending(notification.roomId)) return@Listener
+            onWebinarQaSnapshot?.invoke(notification)
+        })
+
+        socket.on(SocketEvent.webinarHandQueueChanged, Emitter.Listener { args ->
+            if (this.socket !== socket) return@Listener
+            val notification = decode<WebinarHandQueueChangedNotification>(args.firstOrNull()) ?: return@Listener
+            if (!eventRoomIdMatchesActiveOrPending(notification.roomId)) return@Listener
+            onWebinarHandQueueChanged?.invoke(notification)
+        })
+
+        socket.on(SocketEvent.webinarPromoted, Emitter.Listener { args ->
+            if (this.socket !== socket) return@Listener
+            val notification = decode<WebinarPromotedNotification>(args.firstOrNull()) ?: return@Listener
+            if (!eventRoomIdMatchesActiveOrPending(notification.roomId)) return@Listener
+            onWebinarPromoted?.invoke(notification)
+        })
+
+        socket.on(SocketEvent.webinarDemoted, Emitter.Listener { args ->
+            if (this.socket !== socket) return@Listener
+            val notification = decode<WebinarDemotedNotification>(args.firstOrNull()) ?: return@Listener
+            if (!eventRoomIdMatchesActiveOrPending(notification.roomId)) return@Listener
+            onWebinarDemoted?.invoke(notification)
         })
 
         socket.on(SocketEvent.browserState, Emitter.Listener { args ->

@@ -118,6 +118,9 @@ export const emitWebinarAttendeeCountChanged = (
       return;
     }
     emitWebinarAttendeeCountNow(io, state, liveRoom);
+    if (liveRoom.getWebinarAttendeeCount() === 0) {
+      attendeeCountEmitStates.delete(channelId);
+    }
   }, delay);
   emitState.timer.unref?.();
 };

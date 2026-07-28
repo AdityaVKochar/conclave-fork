@@ -166,6 +166,15 @@ export const registerWebinarInteractionHandlers = (
           return;
         }
 
+        const webinarConfig = getOrCreateWebinarRoomConfig(
+          state.webinarConfigs,
+          guard.room.channelId,
+        );
+        if (!webinarConfig.enabled || !webinarConfig.qaEnabled) {
+          respond(callback, { error: "Q&A is turned off for this webinar" });
+          return;
+        }
+
         if (!takeToken(socket, "webinar:qaUpvote", RATE_LIMITS.webinarQaVote)) {
           respond(callback, { error: "You are voting too quickly" });
           return;
@@ -434,8 +443,13 @@ export const registerWebinarInteractionHandlers = (
         } satisfies WebinarDemotedNotification);
 
         // Server-side enforcement, not a client courtesy: tear the seat down
-        // now (producers, transports, presence). The demoted client rejoins
-        // through the public webinar link as a viewer.
+        // now (socket handlers, producers, transports, presence). Disconnect
+        // first so a client that ignores the navigation event cannot keep
+        // invoking handlers through stale currentRoom/currentClient context;
+        // forceRemoveClientNow then cancels the disconnect grace immediately.
+        // The demoted client rejoins through the public webinar link as a
+        // viewer.
+        target.socket.disconnect(true);
         forceRemoveClientNow({
           io,
           state,

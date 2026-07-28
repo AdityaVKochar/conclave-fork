@@ -488,4 +488,22 @@ describe("attendee count fanout debounce", () => {
     // The trailing emit reads the live count, so the final value always lands.
     expect(fixture.emitted[1]?.payload).toMatchObject({ attendeeCount: 3 });
   });
+
+  it("drops the throttle state after a trailing empty-room emit", () => {
+    vi.useFakeTimers();
+    const fixture = makeCountFixture(`debounce-empty-${Math.random()}`);
+
+    fixture.setCount(1);
+    emitWebinarAttendeeCountChanged(fixture.io, fixture.state, fixture.room);
+    fixture.setCount(0);
+    emitWebinarAttendeeCountChanged(fixture.io, fixture.state, fixture.room);
+
+    vi.advanceTimersByTime(1_100);
+    expect(fixture.emitted.at(-1)?.payload).toMatchObject({ attendeeCount: 0 });
+
+    fixture.setCount(1);
+    emitWebinarAttendeeCountChanged(fixture.io, fixture.state, fixture.room);
+    expect(fixture.emitted.at(-1)?.payload).toMatchObject({ attendeeCount: 1 });
+    expect(fixture.emitted).toHaveLength(3);
+  });
 });

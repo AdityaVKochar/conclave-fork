@@ -5,6 +5,7 @@ import {
   type GameMove,
 } from "../types.js";
 import { numberOption, selectOption } from "../config.js";
+import { payloadField } from "../validation.js";
 import {
   generatePuzzle,
   validateMove,
@@ -16,7 +17,7 @@ import {
   type AnchorMap,
   type GeneratedPuzzle,
   type SupportedGridSize,
-} from "./zipSolver.js";
+} from "../zipSolver.js";
 
 /* ------------------------------------------------------------------ */
 /*  Types                                                              */
@@ -42,10 +43,36 @@ type ZipState = {
   solutionPath: CellIndex[];
   players: Record<string, PlayerBoard>;
   roundStartedAt: number;
+  roundEndsAt: number;
+  roundDurationMs: number;
   winnerId: string | null;
   totalRounds: number;
   currentRound: number;
   scores: Record<string, number>;
+};
+
+export type ZipMove =
+  | { type: "start" }
+  | { type: "move"; cells: unknown }
+  | { type: "hint" }
+  | { type: "reset" }
+  | { type: "nextRound" };
+
+const decodeZipMove = (move: GameMove): ZipMove => {
+  switch (move.type) {
+    case "start":
+    case "hint":
+    case "reset":
+    case "nextRound":
+      return { type: move.type };
+    case "move":
+      return {
+        type: "move",
+        cells: payloadField(move.payload, "cells"),
+      };
+    default:
+      throw new GameMoveError(`Unknown move: ${move.type}`);
+  }
 };
 
 /* ------------------------------------------------------------------ */
@@ -116,6 +143,35 @@ const withResultsIfComplete = (state: ZipState, ctx: GameContext): ZipState => {
   };
 };
 
+const withTimeoutResults = (state: ZipState): ZipState => {
+  const players: Record<string, PlayerBoard> = {};
+  for (const [playerId, board] of Object.entries(state.players)) {
+    players[playerId] = board.outcome
+      ? board
+      : {
+          ...board,
+          outcome: "timeout",
+          solvedAt: null,
+        };
+  }
+  const timedOutState = { ...state, players };
+  return {
+    ...timedOutState,
+    phase: "results",
+    winnerId: computeWinnerId(timedOutState),
+    scores: accumulateScores(timedOutState),
+  };
+};
+
+const assertRoundHasTimeRemaining = (
+  state: ZipState,
+  ctx: GameContext,
+): void => {
+  if (state.roundEndsAt > 0 && ctx.now >= state.roundEndsAt) {
+    throw new GameMoveError("Round time is up");
+  }
+};
+
 const parseGridSize = (value: string): SupportedGridSize => {
   const n = parseInt(value, 10);
   if (n === 6 || n === 7 || n === 8 || n === 9) return n;
@@ -169,6 +225,7 @@ const startPlaying = (state: ZipState, ctx: GameContext, round: number): ZipStat
     solutionPath: puzzle.solutionPath,
     players,
     roundStartedAt: ctx.now,
+    roundEndsAt: ctx.now + state.roundDurationMs,
     winnerId: null,
     currentRound: round,
   };
@@ -218,6 +275,16 @@ export const zipModule: GameModule<ZipState> = {
       default: 1,
       presets: [1, 3, 5],
     },
+    {
+      id: "timeLimitMinutes",
+      type: "number",
+      label: "Time limit",
+      min: 1,
+      max: 10,
+      default: 3,
+      presets: [1, 2, 3, 5, 10],
+      suffix: "min",
+    },
   ],
 
   setup(ctx: GameContext): ZipState {
@@ -230,6 +297,9 @@ export const zipModule: GameModule<ZipState> = {
       solutionPath: [],
       players: {},
       roundStartedAt: 0,
+      roundEndsAt: 0,
+      roundDurationMs:
+        numberOption(ctx.config, "timeLimitMinutes", 3) * 60_000,
       winnerId: null,
       totalRounds: numberOption(ctx.config, "rounds", 1),
       currentRound: 0,
@@ -238,7 +308,8 @@ export const zipModule: GameModule<ZipState> = {
   },
 
   onMove(state, move: GameMove, ctx): ZipState {
-    switch (move.type) {
+    const decodedMove = decodeZipMove(move);
+    switch (decodedMove.type) {
       case "start": {
         if (!ctx.isAdmin(move.playerId)) {
           throw new GameMoveError("Only the host can start");
@@ -256,6 +327,7 @@ export const zipModule: GameModule<ZipState> = {
         if (state.phase !== "playing") {
           throw new GameMoveError("Not accepting moves right now");
         }
+        assertRoundHasTimeRemaining(state, ctx);
         const board = state.players[move.playerId];
         if (!board) {
           throw new GameMoveError("You are not in this round");
@@ -264,13 +336,12 @@ export const zipModule: GameModule<ZipState> = {
           throw new GameMoveError("You already finished");
         }
 
-        const payload = move.payload as { cells?: unknown } | undefined;
-        if (!payload || !Array.isArray(payload.cells)) {
+        if (!Array.isArray(decodedMove.cells)) {
           throw new GameMoveError("Invalid move payload");
         }
 
         if (
-          payload.cells.some(
+          decodedMove.cells.some(
             (cell) =>
               !Number.isInteger(cell) ||
               cell < 0 ||
@@ -280,7 +351,7 @@ export const zipModule: GameModule<ZipState> = {
           throw new GameMoveError("Path must contain valid cell IDs");
         }
 
-        const cells = payload.cells as CellIndex[];
+        const cells = decodedMove.cells as CellIndex[];
         if (cells.length === 0) {
           throw new GameMoveError("No cells provided");
         }
@@ -336,6 +407,7 @@ export const zipModule: GameModule<ZipState> = {
         if (state.phase !== "playing") {
           throw new GameMoveError("Not accepting hints right now");
         }
+        assertRoundHasTimeRemaining(state, ctx);
         const board = state.players[move.playerId];
         if (!board) {
           throw new GameMoveError("You are not in this round");
@@ -387,6 +459,7 @@ export const zipModule: GameModule<ZipState> = {
         if (state.phase !== "playing") {
           throw new GameMoveError("Not accepting resets right now");
         }
+        assertRoundHasTimeRemaining(state, ctx);
         const board = state.players[move.playerId];
         if (!board) {
           throw new GameMoveError("You are not in this round");
@@ -422,13 +495,21 @@ export const zipModule: GameModule<ZipState> = {
         return startPlaying(state, ctx, state.currentRound + 1);
       }
 
-      default:
-        throw new GameMoveError(`Unknown move: ${move.type}`);
+      default: {
+        const _exhaustive: never = decodedMove;
+        throw new GameMoveError(
+          `Unknown move: ${(_exhaustive as GameMove).type}`,
+        );
+      }
     }
   },
 
   onTick(state, ctx): ZipState {
     if (state.phase !== "playing") return state;
+
+    if (state.roundEndsAt > 0 && ctx.now >= state.roundEndsAt) {
+      return withTimeoutResults(state);
+    }
 
     // Early completion: all players finished.
     if (allPlayersFinished(state, ctx)) {
@@ -491,6 +572,7 @@ export const zipModule: GameModule<ZipState> = {
       deadCells: state.deadCells,
       serverNow: ctx.now,
       roundStartedAt: state.phase === "lobby" ? null : state.roundStartedAt,
+      roundEndsAt: state.phase === "playing" ? state.roundEndsAt : null,
       standings,
       finishedCount: standings.filter((s) => s.outcome != null).length,
       totalPlayers: standings.length,

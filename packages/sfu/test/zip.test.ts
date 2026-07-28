@@ -22,7 +22,7 @@ const context = (
   players,
   activePlayers: options?.currentPlayers ?? players,
   rng: rng(options?.pickIndex),
-  config: { gridSize: "6", rounds: 1 },
+  config: { gridSize: "6", rounds: 1, timeLimitMinutes: 3 },
   content: null,
   now,
   isAdmin: (playerId) => playerId === "host",
@@ -51,8 +51,8 @@ describe("zip game module", () => {
     expect(zipModule.getPhase(state)).toBe("lobby");
   });
 
-  it("does not expose a configurable time limit", () => {
-    expect(zipModule.options?.some((option) => option.id === "timeLimitMinutes")).toBe(false);
+  it("exposes a configurable time limit", () => {
+    expect(zipModule.options?.some((option) => option.id === "timeLimitMinutes")).toBe(true);
   });
 
   it("rejects start from non-admin", () => {
@@ -79,6 +79,7 @@ describe("zip game module", () => {
     expect(playing.solutionPath.length).toBeGreaterThan(0);
     expect(playing.currentRound).toBe(1);
     expect(playing.roundStartedAt).toBe(1000);
+    expect(playing.roundEndsAt).toBe(181_000);
   });
 
   it("creates player boards for all active players", () => {
@@ -283,7 +284,7 @@ describe("zip game module", () => {
     expect(completed.phase).toBe("results");
   });
 
-  it("does not end the round after arbitrary elapsed time", () => {
+  it("times out unfinished players when the round deadline passes", () => {
     const state = zipModule.setup(context(0));
     const playing = zipModule.onMove(
       state,
@@ -291,11 +292,32 @@ describe("zip game module", () => {
       context(1000),
     );
 
-    const stillPlaying = zipModule.onTick!(playing, context(playing.roundStartedAt + 3_600_000));
-    expect(stillPlaying.phase).toBe("playing");
-    for (const board of Object.values(stillPlaying.players)) {
-      expect(board.outcome).toBeNull();
+    const timedOut = zipModule.onTick!(playing, context(playing.roundEndsAt));
+    expect(timedOut.phase).toBe("results");
+    for (const board of Object.values(timedOut.players)) {
+      expect(board.outcome).toBe("timeout");
     }
+  });
+
+  it("rejects a move that arrives after the round deadline", () => {
+    const state = zipModule.setup(context(0));
+    const playing = zipModule.onMove(
+      state,
+      { playerId: "host", type: "start", payload: undefined },
+      context(1000),
+    );
+
+    expect(() =>
+      zipModule.onMove(
+        playing,
+        {
+          playerId: "alice",
+          type: "move",
+          payload: { cells: playing.solutionPath },
+        },
+        context(playing.roundEndsAt),
+      ),
+    ).toThrow("Round time is up");
   });
 
   it("finishes when all remaining active players have completed after a disconnect", () => {
@@ -415,6 +437,7 @@ describe("zip game module", () => {
       barriers: Array<{ from: number; to: number }>;
       deadCells: number[];
       roundStartedAt: number;
+      roundEndsAt: number;
       standings: Array<{ playerId: string; cellsFilled: number }>;
       result: unknown;
     };
@@ -423,6 +446,7 @@ describe("zip game module", () => {
     expect(Array.isArray(pub.barriers)).toBe(true);
     expect(Array.isArray(pub.deadCells)).toBe(true);
     expect(pub.roundStartedAt).toBe(1000);
+    expect(pub.roundEndsAt).toBe(181_000);
     expect(pub.standings.length).toBe(3);
     expect(pub.result).toBeNull(); // Solution not revealed during play.
   });

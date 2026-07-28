@@ -3643,6 +3643,9 @@ internal class WebRTCClient : SendTransport.Listener, RecvTransport.Listener, Pr
         if (connectionQuality == ConnectionQuality.fair) {
             return constrainedWebcamCaptureProfile(configured, 640, 360, 20)
         }
+        if (quality == VideoQuality.low) {
+            return constrainedWebcamCaptureProfile(configured, 640, 360, 20)
+        }
         return configured
     }
 
@@ -3682,6 +3685,11 @@ internal class WebRTCClient : SendTransport.Listener, RecvTransport.Listener, Pr
         }
 
         val lastIndex = defaults.lastIndex
+        val effectiveMaximumBitrate = if (quality == VideoQuality.low) {
+            minOf(configuredCameraMaxBitrateBps, defaultMaximumBitrate)
+        } else {
+            configuredCameraMaxBitrateBps
+        }
         return defaults.mapIndexed { index, spec ->
             val bitrateRatio = spec.maxBitrateBps.toDouble() / defaultMaximumBitrate.toDouble()
             val detailLayerFactor =
@@ -3691,7 +3699,7 @@ internal class WebRTCClient : SendTransport.Listener, RecvTransport.Listener, Pr
                 scaleResolutionDownBy = spec.scaleResolutionDownBy,
                 maxBitrateBps = maxOf(
                     20_000,
-                    (configuredCameraMaxBitrateBps.toDouble() * bitrateRatio * detailLayerFactor).toInt(),
+                    (effectiveMaximumBitrate.toDouble() * bitrateRatio * detailLayerFactor).toInt(),
                 ),
                 maxFramerate = if (index == lastIndex) {
                     configuredCameraFrameRate

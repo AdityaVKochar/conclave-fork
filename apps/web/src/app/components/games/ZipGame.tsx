@@ -27,6 +27,7 @@ type ZipPublic = {
   deadCells: CellIndex[];
   serverNow: number;
   roundStartedAt: number | null;
+  roundEndsAt: number | null;
   standings: Array<{
     playerId: string;
     playerName: string;
@@ -113,16 +114,11 @@ const statusText = (outcome: PlayerOutcome | null): string => {
   return "Playing";
 };
 
-const formatElapsedTime = (ms: number): string => {
-  const totalMs = Math.max(0, Math.floor(ms));
-  const minutes = Math.floor(totalMs / 60_000);
-  const seconds = Math.floor(totalMs / 1_000) % 60;
-  const milliseconds = (totalMs % 1_000).toString().padStart(3, "0");
-  const secondPart = seconds.toString().padStart(2, "0");
-
-  return minutes > 0
-    ? `${minutes.toString().padStart(2, "0")}:${secondPart}:${milliseconds}`
-    : `${secondPart}:${milliseconds}`;
+const formatRemainingTime = (ms: number): string => {
+  const totalSeconds = Math.max(0, Math.ceil(ms / 1_000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${minutes}:${seconds.toString().padStart(2, "0")}`;
 };
 
 const formatSolveTime = (solvedAt: number | null, roundStartedAt: number | null): string | null => {
@@ -132,36 +128,6 @@ const formatSolveTime = (solvedAt: number | null, roundStartedAt: number | null)
   const minutes = Math.floor(tenths / 600).toString();
   const seconds = Math.floor((tenths % 600) / 10).toString().padStart(2, "0");
   return `${minutes}:${seconds}.${tenths % 10}`;
-};
-
-const useElapsedTime = (
-  roundStartedAt: number | null | undefined,
-  serverNow: number | null | undefined,
-): number => {
-  const [elapsed, setElapsed] = useState(0);
-  const baseRef = useRef({ roundStartedAt, serverNow, at: Date.now() });
-
-  useEffect(() => {
-    if (roundStartedAt == null || serverNow == null) {
-      setElapsed(0);
-      return;
-    }
-
-    baseRef.current = { roundStartedAt, serverNow, at: Date.now() };
-    const update = () => {
-      const base = baseRef.current;
-      if (base.roundStartedAt == null || base.serverNow == null) {
-        setElapsed(0);
-        return;
-      }
-      setElapsed(Math.max(0, base.serverNow - base.roundStartedAt + Date.now() - base.at));
-    };
-    update();
-    const interval = window.setInterval(update, 50);
-    return () => window.clearInterval(interval);
-  }, [roundStartedAt, serverNow]);
-
-  return elapsed;
 };
 
 /* ------------------------------------------------------------------ */
@@ -533,7 +499,7 @@ export default function ZipGame({
   const [flashCell, setFlashCell] = useState<CellCoord | null>(null);
   const pathRef = useRef(localPath);
 
-  const elapsedMs = useElapsedTime(pub.roundStartedAt, pub.serverNow);
+  const roundRemainingMs = useRemaining(pub.roundEndsAt, pub.serverNow);
   const hintCooldownMs = useRemaining(me.hintAvailableAt, pub.serverNow);
   const checkpoints = useMemo(
     () =>
@@ -649,7 +615,13 @@ export default function ZipGame({
 
   const handlePointerDownCell = useCallback(
     (cell: CellCoord) => {
-      if (readOnly || me.outcome != null || pub.phase !== "playing" || startCell == null) return;
+      if (
+        busyRef.current ||
+        readOnly ||
+        me.outcome != null ||
+        pub.phase !== "playing" ||
+        startCell == null
+      ) return;
 
       const nextCell = coordToCell(cell, pub.gridSize);
       const currentPath = pathRef.current;
@@ -685,7 +657,13 @@ export default function ZipGame({
 
   const handlePointerEnterCell = useCallback(
     (cell: CellCoord) => {
-      if (!drawingRef.current || readOnly || me.outcome != null || pub.phase !== "playing") return;
+      if (
+        busyRef.current ||
+        !drawingRef.current ||
+        readOnly ||
+        me.outcome != null ||
+        pub.phase !== "playing"
+      ) return;
 
       const nextCell = coordToCell(cell, pub.gridSize);
       const currentPath = pathRef.current;
@@ -738,20 +716,35 @@ export default function ZipGame({
   };
 
   const handleUndo = () => {
-    if (localPath.length <= 1 || readOnly || me.outcome != null) return;
+    if (
+      busyRef.current ||
+      localPath.length <= 1 ||
+      readOnly ||
+      me.outcome != null
+    ) return;
     const newPath = localPath.slice(0, -1);
     updateLocalPath(newPath);
     void submitPath(newPath);
   };
 
   const handleReset = () => {
-    if (readOnly || me.outcome != null || startCell == null) return;
+    if (
+      busyRef.current ||
+      readOnly ||
+      me.outcome != null ||
+      startCell == null
+    ) return;
     updateLocalPath([startCell]);
     void runMove("reset");
   };
 
   const handleHint = () => {
-    if (readOnly || me.outcome != null || hintCooldownMs > 0) return;
+    if (
+      busyRef.current ||
+      readOnly ||
+      me.outcome != null ||
+      hintCooldownMs > 0
+    ) return;
     void runMove("hint");
   };
 
@@ -930,10 +923,10 @@ export default function ZipGame({
         </div>
         <div style={{ textAlign: "right" }}>
           <p style={{ margin: 0, color: color.textFaint, fontFamily: HEAD_FONT, fontSize: 10 }}>
-            Elapsed
+            Remaining
           </p>
           <p style={{ margin: "2px 0 0", color: color.text, fontFamily: HEAD_FONT, fontSize: 16 }}>
-            {formatElapsedTime(elapsedMs)}
+            {formatRemainingTime(roundRemainingMs)}
           </p>
         </div>
       </div>

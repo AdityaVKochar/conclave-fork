@@ -2578,6 +2578,9 @@ final class WebRTCClient: NSObject, ObservableObject {
         if connectionQuality == .fair {
             return constrainedWebcamCaptureProfile(configured, maxWidth: 640, maxHeight: 360, maxFPS: 20)
         }
+        if quality == .low {
+            return constrainedWebcamCaptureProfile(configured, maxWidth: 640, maxHeight: 360, maxFPS: 20)
+        }
         return configured
     }
 
@@ -2615,6 +2618,9 @@ final class WebRTCClient: NSObject, ObservableObject {
         }
 
         let lastIndex = defaults.count - 1
+        let effectiveMaximumBitrate = quality == .low
+            ? min(configuredCameraMaxBitrateBps, defaultMaximumBitrate)
+            : configuredCameraMaxBitrateBps
         return defaults.enumerated().map { index, spec in
             let bitrateRatio = Double(spec.maxBitrateBps) / Double(defaultMaximumBitrate)
             let detailLayerFactor = configuredCameraContentHint == NativeCameraContentHint.detail.rawValue && index < lastIndex
@@ -2625,7 +2631,7 @@ final class WebRTCClient: NSObject, ObservableObject {
                 scaleResolutionDownBy: spec.scaleResolutionDownBy,
                 maxBitrateBps: max(
                     20_000,
-                    Int((Double(configuredCameraMaxBitrateBps) * bitrateRatio * detailLayerFactor).rounded())
+                    Int((Double(effectiveMaximumBitrate) * bitrateRatio * detailLayerFactor).rounded())
                 ),
                 maxFramerate: index == lastIndex
                     ? Double(configuredCameraFrameRate)

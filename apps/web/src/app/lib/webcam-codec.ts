@@ -451,13 +451,18 @@ const getBaseEncodingCaps = (
 
   const defaultMaximumBitrate =
     quality === "low" ? LOW_VIDEO_MAX_BITRATE : STANDARD_VIDEO_MAX_BITRATE;
+  const effectiveMaximumBitrate = publishSettings
+    ? quality === "low"
+      ? Math.min(publishSettings.maxBitrate, defaultMaximumBitrate)
+      : publishSettings.maxBitrate
+    : defaultMaximumBitrate;
 
   return baseEncodings.map((encoding, index) => {
     const bitrateRatio = encoding.maxBitrate / defaultMaximumBitrate;
     const isHighestLayer = index === baseEncodings.length - 1;
     return {
       maxBitrate: publishSettings
-        ? Math.max(20000, Math.round(publishSettings.maxBitrate * bitrateRatio))
+        ? Math.max(20000, Math.round(effectiveMaximumBitrate * bitrateRatio))
         : encoding.maxBitrate,
       maxFramerate: publishSettings
         ? isHighestLayer
@@ -839,7 +844,10 @@ const getVp9SvcEncodingCap = (
   const base = buildWebcamSingleLayerEncoding(quality);
   const configuredBase = publishSettings
     ? {
-        maxBitrate: publishSettings.maxBitrate,
+        maxBitrate:
+          quality === "low"
+            ? Math.min(publishSettings.maxBitrate, base.maxBitrate)
+            : publishSettings.maxBitrate,
         maxFramerate: publishSettings.frameRate,
       }
     : base;
@@ -862,11 +870,10 @@ const getVp9SvcEncodingCap = (
     };
   }
   return {
-    maxBitrate: publishSettings
-      ? publishSettings.maxBitrate
-      : quality === "standard"
+    maxBitrate:
+      quality === "standard" && !publishSettings
         ? VP9_SVC_STANDARD_MAX_BITRATE
-        : base.maxBitrate,
+        : configuredBase.maxBitrate,
     maxFramerate: configuredBase.maxFramerate,
   };
 };

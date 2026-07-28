@@ -5,7 +5,7 @@ import {
   validateCompletePath,
   solveForHint,
   type GeneratedPuzzle,
-} from "../server/games/modules/zipSolver.js";
+} from "../server/games/zipSolver.js";
 
 describe("zipSolver", () => {
   describe("puzzle variation", () => {

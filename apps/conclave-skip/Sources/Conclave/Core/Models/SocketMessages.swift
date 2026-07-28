@@ -1231,6 +1231,17 @@ struct ChatHistorySnapshotNotification: Codable {
     let roomId: String?
 }
 
+struct ChatMessageReaction: Codable, Equatable {
+    let emoji: String
+    let userIds: [String]
+}
+
+struct ChatReactionChangedNotification: Codable {
+    let messageId: String
+    let reactions: [ChatMessageReaction]
+    let roomId: String
+}
+
 extension ChatMessageNotification {
     var chatMessage: ChatMessage {
         chatMessage(taggedRoomId: nil)
@@ -1877,6 +1888,67 @@ struct WebinarParticipantJoinedNotification: Codable {
         try container.encode(userId, forKey: .userId)
         try container.encodeIfPresent(displayName, forKey: .displayName)
     }
+}
+
+enum WebinarQaStatus: String, Codable {
+    case pending
+    case answering
+    case answered
+    case dismissed
+}
+
+struct WebinarQaEntry: Codable {
+    let id: String
+    let userId: String
+    let displayName: String
+    let question: String
+    let status: WebinarQaStatus
+    let askedAt: Double
+    let updatedAt: Double
+    let upvotes: Int
+    let hasUpvoted: Bool?
+    let answerText: String?
+    let answeredByName: String?
+}
+
+struct WebinarQaSnapshot: Codable {
+    let roomId: String
+    let qaEntries: [WebinarQaEntry]
+
+    enum CodingKeys: String, CodingKey {
+        case roomId
+        // Avoid generating a Kotlin enum member named `entries`, which
+        // conflicts with Kotlin's built-in Enum.entries property.
+        case qaEntries = "entries"
+    }
+}
+
+struct WebinarQaChangedNotification: Codable {
+    let roomId: String
+    let entry: WebinarQaEntry?
+    let removedId: String?
+}
+
+struct WebinarHandQueueEntry: Codable {
+    let userId: String
+    let displayName: String
+    let raisedAt: Double
+}
+
+struct WebinarHandQueueChangedNotification: Codable {
+    let roomId: String
+    let queue: [WebinarHandQueueEntry]
+}
+
+struct WebinarPromotedNotification: Codable {
+    let roomId: String
+    let rejoinRoomId: String
+    let promotedByName: String?
+}
+
+struct WebinarDemotedNotification: Codable {
+    let roomId: String
+    let webinarLinkSlug: String?
 }
 
 struct WaitingRoomStatusNotification: Codable {

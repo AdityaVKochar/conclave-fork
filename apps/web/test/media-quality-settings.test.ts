@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import type { RtpCodecCapability } from "mediasoup-client/types";
 import {
   CAMERA_QUALITY_PRESETS,
   DEFAULT_MEDIA_QUALITY_SETTINGS,
@@ -225,6 +226,13 @@ describe("media quality settings", () => {
       height: { ideal: 360, max: 360 },
       frameRate: { ideal: 20, max: 20 },
     });
+    expect(
+      buildCameraVideoConstraints("low", "good", undefined, studio),
+    ).toMatchObject({
+      width: { ideal: 640, max: 640 },
+      height: { ideal: 360, max: 360 },
+      frameRate: { ideal: 20, max: 20 },
+    });
   });
 
   it("uses manual camera bitrate and cadence in the actual producer encodings", async () => {
@@ -251,6 +259,68 @@ describe("media quality settings", () => {
       maxFramerate: 60,
     });
     expect(options?.encodings?.[0]?.maxBitrate).toBeLessThan(250_000);
+  });
+
+  it("keeps the room-level low-quality bitrate ceiling with a studio preset", async () => {
+    const publishSettings = resolveCameraPublishSettings({
+      preset: "studio",
+      ...CAMERA_QUALITY_PRESETS.studio,
+    });
+    const producer = {} as Producer;
+    const produce = vi.fn(async () => producer);
+
+    await produceWebcamTrack({
+      transport: { produce } as unknown as Transport,
+      track: createTrack({ width: 640, height: 360, frameRate: 20 }),
+      quality: "low",
+      networkProfile: "good",
+      paused: false,
+      forceSimulcast: true,
+      publishSettings,
+    });
+
+    const encodings = produce.mock.calls[0]?.[0]?.encodings ?? [];
+    expect(encodings).toHaveLength(2);
+    expect(Math.max(...encodings.map((encoding) => encoding.maxBitrate ?? 0))).toBe(
+      260_000,
+    );
+  });
+
+  it("keeps the low-quality ceiling for negotiated VP9 SVC", async () => {
+    const publishSettings = resolveCameraPublishSettings({
+      preset: "studio",
+      ...CAMERA_QUALITY_PRESETS.studio,
+    });
+    const producer = {} as Producer;
+    const produce = vi.fn(async () => producer);
+    const preferredCodec = {
+      kind: "video",
+      mimeType: "video/VP9",
+      clockRate: 90_000,
+      parameters: { "profile-id": 0 },
+      rtcpFeedback: [],
+    } satisfies RtpCodecCapability;
+
+    await produceWebcamTrack({
+      transport: { produce } as unknown as Transport,
+      track: createTrack({ width: 640, height: 360, frameRate: 20 }),
+      quality: "low",
+      networkProfile: "good",
+      paused: false,
+      preferredCodec,
+      codecPolicy: {
+        codec: "vp9",
+        mimeType: "video/VP9",
+        profileId: 0,
+        scalabilityMode: "L2T1",
+        epoch: 1,
+      },
+      publishSettings,
+    });
+
+    expect(produce.mock.calls[0]?.[0]?.encodings?.[0]?.maxBitrate).toBe(
+      260_000,
+    );
   });
 
   it("reapplies a manual HD bitrate to an existing adaptive sender", async () => {
