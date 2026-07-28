@@ -391,6 +391,8 @@ export type MeetsClientProps = {
   joinMode?: JoinMode;
   autoJoinOnMount?: boolean;
   hideJoinUI?: boolean;
+  /** Public webinar title shown in the attendee viewer chrome. */
+  webinarTitle?: string;
   getRooms?: () => Promise<RoomInfo[]>;
   getRoom?: (roomId: string) => Promise<RoomInfo | null>;
   reactionAssets?: string[];
@@ -407,6 +409,7 @@ export default function MeetsClient({
   joinMode = "meeting",
   autoJoinOnMount = false,
   hideJoinUI = false,
+  webinarTitle,
   getRooms,
   getRoom,
   reactionAssets,
@@ -594,6 +597,14 @@ export default function MeetsClient({
     setWebinarLink,
     webinarSpeakerUserId,
     setWebinarSpeakerUserId,
+    webinarQaEntries,
+    setWebinarQaEntries,
+    webinarHandQueue,
+    setWebinarHandQueue,
+    isWebinarHandRaised,
+    setIsWebinarHandRaised,
+    webinarStageInvite,
+    setWebinarStageInvite,
     serverRestartNotice,
     setServerRestartNotice,
     adminNotice,
@@ -2261,6 +2272,28 @@ export default function MeetsClient({
     }
   }, [setMeetError, setRoomId, setWaitingMessage]);
 
+  const webinarConfigRef = useRef(webinarConfig);
+  webinarConfigRef.current = webinarConfig;
+
+  // Host moved this promoted speaker back to the audience: a full navigation
+  // to the public webinar page tears down all publish state and rejoins as a
+  // view-only attendee.
+  const handleWebinarDemoted = useCallback(
+    (notification: { webinarLinkSlug?: string | null }) => {
+      if (typeof window === "undefined") return;
+      const slug =
+        notification.webinarLinkSlug?.trim() ||
+        webinarConfigRef.current?.linkSlug?.trim() ||
+        "";
+      if (slug) {
+        window.location.assign(`/w/${encodeURIComponent(slug)}`);
+      } else {
+        window.location.assign("/");
+      }
+    },
+    [],
+  );
+
   const socket = useMeetSocket({
     refs,
     roomId,
@@ -2294,6 +2327,11 @@ export default function MeetsClient({
     setWebinarConfig,
     setWebinarRole,
     setWebinarSpeakerUserId,
+    setWebinarQaEntries,
+    setWebinarHandQueue,
+    setIsWebinarHandRaised,
+    setWebinarStageInvite,
+    onWebinarDemoted: handleWebinarDemoted,
     isMuted,
     setIsMuted,
     isCameraOff,
@@ -2342,6 +2380,24 @@ export default function MeetsClient({
     onLocalRoomEnded: handleLocalRoomEnded,
     bypassMediaPermissions,
   });
+
+  // Accepting a stage invite rejoins the same room as a full participant via
+  // navigation: the join screen doubles as the mic/camera prejoin, and the
+  // server-side promotion registry waves this identity through the gates.
+  const handleAcceptWebinarStageInvite = useCallback(() => {
+    if (!webinarStageInvite || typeof window === "undefined") return;
+    window.location.assign(
+      `/${encodeURIComponent(webinarStageInvite.rejoinRoomId)}`,
+    );
+  }, [webinarStageInvite]);
+
+  const declineWebinarStageInvite = socket.declineWebinarStageInvite;
+  const handleDismissWebinarStageInvite = useCallback(() => {
+    setWebinarStageInvite(null);
+    // Declining releases the server-side invite, so "Not now" does not leave
+    // a standing gate bypass attached to this identity.
+    declineWebinarStageInvite();
+  }, [setWebinarStageInvite, declineWebinarStageInvite]);
 
   useEffect(() => {
     ensureProducerTransportRef.current = socket.ensureProducerTransport;
@@ -3465,6 +3521,31 @@ export default function MeetsClient({
         webinarRole={webinarRole}
         webinarSpeakerUserId={webinarSpeakerUserId}
         webinarLink={webinarLink}
+        webinarTitle={webinarTitle}
+        webinarQaEntries={webinarQaEntries}
+        webinarHandQueue={webinarHandQueue}
+        isWebinarHandRaised={isWebinarHandRaised}
+        webinarStageInvite={webinarStageInvite}
+        onDismissWebinarStageInvite={handleDismissWebinarStageInvite}
+        onAcceptWebinarStageInvite={handleAcceptWebinarStageInvite}
+        onSubmitWebinarQuestion={
+          isWebinarAttendee ? socket.submitWebinarQuestion : undefined
+        }
+        onUpvoteWebinarQuestion={
+          isWebinarAttendee ? socket.upvoteWebinarQuestion : undefined
+        }
+        onModerateWebinarQuestion={
+          canModerateMeeting ? socket.moderateWebinarQuestion : undefined
+        }
+        onSetWebinarHandRaised={
+          isWebinarAttendee ? socket.setWebinarHandRaisedRemote : undefined
+        }
+        onPromoteWebinarAttendee={
+          canModerateMeeting ? socket.promoteWebinarAttendee : undefined
+        }
+        onDemoteWebinarParticipant={
+          canModerateMeeting ? socket.demoteWebinarParticipant : undefined
+        }
         onSetWebinarLink={setWebinarLink}
         onGetMeetingConfig={
           canModerateMeeting ? socket.getMeetingConfig : undefined

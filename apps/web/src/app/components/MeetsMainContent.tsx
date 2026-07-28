@@ -24,6 +24,12 @@ import MeetingAppLayout from "./MeetingAppLayout";
 import ScreenShareAudioPlayers from "./ScreenShareAudioPlayers";
 import SystemAudioPlayers from "./SystemAudioPlayers";
 import ParticipantVideo from "./ParticipantVideo";
+import ParticipantAudio from "./ParticipantAudio";
+import WebinarViewerChrome, {
+  WebinarQaPanel,
+  WebinarStageInviteDialog,
+  WebinarWaitingCard,
+} from "./WebinarViewer";
 import ToastQueue from "./ToastQueue";
 import TranscriptPanel from "./TranscriptPanel";
 import AndroidUpsellSheet from "./AndroidUpsellSheet";
@@ -61,7 +67,10 @@ import type {
   ReactionOption,
   SendChatMessageOptions,
   WebinarConfigSnapshot,
+  WebinarHandQueueEntry,
   WebinarLinkResponse,
+  WebinarQaEntry,
+  WebinarQaModerateRequest,
   WebinarUpdateRequest,
   PrejoinMediaHandoff,
 } from "../lib/types";
@@ -298,6 +307,30 @@ interface MeetsMainContentProps {
   webinarRole?: "attendee" | "participant" | "host" | null;
   webinarSpeakerUserId?: string | null;
   webinarLink?: string | null;
+  webinarTitle?: string;
+  webinarQaEntries?: WebinarQaEntry[];
+  webinarHandQueue?: WebinarHandQueueEntry[];
+  isWebinarHandRaised?: boolean;
+  webinarStageInvite?: {
+    promotedByName?: string;
+    rejoinRoomId: string;
+  } | null;
+  onAcceptWebinarStageInvite?: () => void;
+  onDismissWebinarStageInvite?: () => void;
+  onSubmitWebinarQuestion?: (
+    question: string,
+  ) => Promise<{ ok: boolean; error?: string }>;
+  onUpvoteWebinarQuestion?: (id: string) => void;
+  onModerateWebinarQuestion?: (
+    request: WebinarQaModerateRequest,
+  ) => Promise<{ ok: boolean; error?: string }>;
+  onSetWebinarHandRaised?: (raised: boolean) => void;
+  onPromoteWebinarAttendee?: (
+    userId: string,
+  ) => Promise<{ ok: boolean; error?: string }>;
+  onDemoteWebinarParticipant?: (
+    userId: string,
+  ) => Promise<{ ok: boolean; error?: string }>;
   onSetWebinarLink?: (link: string | null) => void;
   onGetMeetingConfig?: () => Promise<MeetingConfigSnapshot | null>;
   onUpdateMeetingConfig?: (
@@ -365,20 +398,6 @@ const getGameDockMaxWidth = (
     GAME_DOCK_MIN_WIDTH,
     GAME_DOCK_MAX_WIDTH,
   );
-
-const getPipCornerClass = (corner: PipCorner): string => {
-  switch (corner) {
-    case "top-left":
-      return "top-4 left-4";
-    case "top-right":
-      return "top-4 right-4";
-    case "bottom-left":
-      return "bottom-4 left-4";
-    case "bottom-right":
-    default:
-      return "bottom-4 right-4";
-  }
-};
 
 export default function MeetsMainContent({
   isJoined,
@@ -548,6 +567,19 @@ export default function MeetsMainContent({
   webinarRole,
   webinarSpeakerUserId,
   webinarLink,
+  webinarTitle,
+  webinarQaEntries = [],
+  webinarHandQueue = [],
+  isWebinarHandRaised = false,
+  webinarStageInvite = null,
+  onAcceptWebinarStageInvite,
+  onDismissWebinarStageInvite,
+  onSubmitWebinarQuestion,
+  onUpvoteWebinarQuestion,
+  onModerateWebinarQuestion,
+  onSetWebinarHandRaised,
+  onPromoteWebinarAttendee,
+  onDemoteWebinarParticipant,
   onSetWebinarLink,
   onGetMeetingConfig,
   onUpdateMeetingConfig,
@@ -654,6 +686,25 @@ export default function MeetsMainContent({
   } | null>(null);
   const [webinarAudioBlocked, setWebinarAudioBlocked] = useState(false);
   const [webinarAudioPlaybackAttempt, setWebinarAudioPlaybackAttempt] = useState(0);
+  const [isWebinarQaOpen, setIsWebinarQaOpen] = useState(false);
+  const [webinarQaSeenAt, setWebinarQaSeenAt] = useState(0);
+  useEffect(() => {
+    if (isWebinarQaOpen) setWebinarQaSeenAt(Date.now());
+  }, [isWebinarQaOpen, webinarQaEntries]);
+  const unseenWebinarQaCount = useMemo(() => {
+    if (isWebinarQaOpen) return 0;
+    return webinarQaEntries.filter(
+      (entry) =>
+        (entry.status === "answering" || entry.status === "answered") &&
+        entry.updatedAt > webinarQaSeenAt,
+    ).length;
+  }, [isWebinarQaOpen, webinarQaEntries, webinarQaSeenAt]);
+  const handleToggleWebinarQa = useCallback(() => {
+    setIsWebinarQaOpen((previous) => !previous);
+  }, []);
+  const handleToggleWebinarHand = useCallback(() => {
+    onSetWebinarHandRaised?.(!isWebinarHandRaised);
+  }, [onSetWebinarHandRaised, isWebinarHandRaised]);
   const [participantAudioBlocked, setParticipantAudioBlocked] = useState(false);
   const [participantAudioPlaybackAttempt, setParticipantAudioPlaybackAttempt] =
     useState(0);
@@ -919,7 +970,39 @@ export default function MeetsMainContent({
     stableWebinarSpeakerId,
     webinarSpeakerUserId,
   ]);
-  const pipCornerClass = useMemo(() => getPipCornerClass(pipCorner), [pipCorner]);
+  // "Live" means real program media — a silent host holding the stage as an
+  // avatar tile still reads as "Waiting" to the audience.
+  const webinarStageIsLive = useMemo(() => {
+    if (!isWebinarAttendee || !webinarStage) return false;
+    if (webinarStage.main.participant.videoStream) return true;
+    return nonSystemParticipants.some(
+      (participant) => !participant.isMuted && participant.audioStream,
+    );
+  }, [isWebinarAttendee, webinarStage, nonSystemParticipants]);
+  // Before the first live media, a silent panelist roster shows the branded
+  // waiting state, not a giant avatar. After going live once, the stage stays
+  // up through quiet gaps (everyone briefly muted is not "waiting").
+  const [hasWebinarStageBeenLive, setHasWebinarStageBeenLive] = useState(false);
+  useEffect(() => {
+    if (webinarStageIsLive) setHasWebinarStageBeenLive(true);
+  }, [webinarStageIsLive]);
+  const showWebinarStage =
+    Boolean(webinarStage) && (webinarStageIsLive || hasWebinarStageBeenLive);
+  // On the attendee stage the chrome owns the corners (title card up top,
+  // control row at the bottom), so the presenter PiP docks clear of both.
+  const webinarPipCornerClass = useMemo(() => {
+    switch (pipCorner) {
+      case "top-left":
+        return "top-24 left-5";
+      case "top-right":
+        return "top-24 right-5";
+      case "bottom-left":
+        return "bottom-24 left-5";
+      case "bottom-right":
+      default:
+        return "bottom-24 right-5";
+    }
+  }, [pipCorner]);
   const handlePipPointerDown = useCallback(
     (event: PointerEvent<HTMLDivElement>) => {
       const stage = webinarStageRef.current;
@@ -1741,7 +1824,11 @@ export default function MeetsMainContent({
   return (
     <div
       className={`flex-1 flex flex-col relative ${
-        isJoined ? "overflow-hidden p-4" : "overflow-y-auto p-0"
+        isJoined
+          ? isWebinarAttendee
+            ? "overflow-hidden p-0"
+            : "overflow-hidden p-4"
+          : "overflow-y-auto p-0"
       }`}
       style={mainContentStyle}
     >
@@ -1976,46 +2063,37 @@ export default function MeetsMainContent({
                   ? "getting you in"
                   : "almost there";
             return (
-              <main className="flex min-h-dvh items-center justify-center bg-[#0a0a0b] px-4 py-10 text-[#fafafa]">
-                <section className="animate-fade-in w-full max-w-[420px] rounded-2xl border border-white/10 bg-[#0e0e10] p-6 sm:p-8 text-center">
-                  <div className="mx-auto mb-4 flex items-center justify-center gap-2">
-                    <span
-                      className={`h-2 w-2 rounded-full ${
-                        isFatal ? "bg-[#F95F4A]" : "bg-[#F95F4A] animate-pulse"
-                      }`}
-                    />
-                    <span className="text-[11.5px] font-semibold uppercase tracking-[0.07em] text-[#fafafa]/40">
-                      {isFatal
-                        ? "Couldn't join the room"
-                        : isWaitingForHost
-                          ? "The room isn't open yet"
-                          : isLoading
-                            ? "Connecting"
-                            : "Preparing"}
-                    </span>
-                  </div>
+              <main className="flex min-h-dvh items-center justify-center bg-[#0a0a0b] px-6 py-10 text-[#fafafa]">
+                <div className="animate-fade-in w-full max-w-md text-center">
+                  {!isFatal && !isWaitingForHost ? (
+                    <div className="relative mx-auto mb-5 h-9 w-9">
+                      <div className="absolute inset-0 rounded-full border-2 border-[#fafafa]/10" />
+                      <div className="absolute inset-0 animate-spin rounded-full border-2 border-transparent border-t-[#F95F4A]" />
+                    </div>
+                  ) : null}
                   <h1
-                    className="text-[22px] leading-tight text-[#fafafa]"
+                    className="text-balance text-[24px] leading-tight text-[#fafafa]"
                     style={{ fontFamily: "'PolySans Bulky Wide', sans-serif" }}
                   >
                     {headline}
                   </h1>
-                  {isWaitingForHost ? (
-                    <p className="mt-2 text-[13.5px] leading-snug text-[#fafafa]/55">
-                      Hang tight. This page will refresh on its own the moment
-                      the host opens the room.
-                    </p>
-                  ) : isFatal ? (
-                    <p className="mt-2 text-[13.5px] leading-snug text-[#fafafa]/55">
-                      {errorMessage}
-                    </p>
-                  ) : (
-                    <p className="mt-2 text-[13.5px] leading-snug text-[#fafafa]/55">
-                      Sit tight. Getting your camera, mic, and the room ready in
-                      a moment.
-                    </p>
-                  )}
-                </section>
+                  <p className="mx-auto mt-3 max-w-[340px] text-pretty text-[13.5px] leading-relaxed text-[#fafafa]/55">
+                    {isWaitingForHost
+                      ? "Hang tight. This page will refresh on its own the moment the host opens the room."
+                      : isFatal
+                        ? errorMessage
+                        : "Sit tight. Getting the room ready in a moment."}
+                  </p>
+                  {isFatal ? (
+                    <button
+                      type="button"
+                      onClick={() => window.location.reload()}
+                      className="mt-7 inline-flex h-11 items-center justify-center rounded-full bg-[#F95F4A] px-6 text-[14px] font-medium text-white transition-[filter] duration-150 hover:brightness-105"
+                    >
+                      Try again
+                    </button>
+                  ) : null}
+                </div>
               </main>
             );
           })()
@@ -2049,9 +2127,29 @@ export default function MeetsMainContent({
           />
         )
       ) : isWebinarAttendee ? (
-        <div className="relative flex flex-1 items-center justify-center p-4">
-          {webinarStage ? (
-            <div ref={webinarStageRef} className="relative h-[72vh] w-full max-w-6xl">
+        <div
+          ref={webinarStageRef}
+          className={`relative flex min-h-0 flex-1 flex-col overflow-hidden bg-[#0a0a0b] ${isWebinarQaOpen ? "sm:mr-[380px]" : ""}`}
+        >
+          {/* Every panelist stays audible even when they are not on stage. */}
+          <div
+            className="pointer-events-none h-0 w-0 overflow-hidden"
+            aria-hidden={true}
+          >
+            {nonSystemParticipants.map((participant) => (
+              <ParticipantAudio
+                key={`webinar-audio-${participant.userId}`}
+                participant={participant}
+                audioOutputDeviceId={audioOutputDeviceId}
+                onAudioAutoplayBlocked={handleWebinarAudioAutoplayBlocked}
+                onAudioPlaybackStarted={handleWebinarAudioPlaybackStarted}
+                audioPlaybackAttemptToken={webinarAudioPlaybackAttempt}
+              />
+            ))}
+          </div>
+
+          {webinarStage && showWebinarStage ? (
+            <div className="webinar-stage-main relative min-h-0 flex-1">
               <ParticipantVideo
                 key={webinarStage.main.participant.userId}
                 participant={webinarStage.main.participant}
@@ -2059,15 +2157,13 @@ export default function MeetsMainContent({
                 isActiveSpeaker={
                   activeSpeakerId === webinarStage.main.participant.userId
                 }
-                audioOutputDeviceId={audioOutputDeviceId}
+                disableAudio
+                hideLabel
                 videoObjectFit={webinarStage.isScreenShare ? "contain" : "cover"}
-                onAudioAutoplayBlocked={handleWebinarAudioAutoplayBlocked}
-                onAudioPlaybackStarted={handleWebinarAudioPlaybackStarted}
-                audioPlaybackAttemptToken={webinarAudioPlaybackAttempt}
               />
               {webinarStage.pip ? (
                 <div
-                  className={`absolute h-28 w-44 overflow-hidden rounded-xl border border-[#fafafa]/20 bg-black/75 shadow-[0_16px_36px_rgba(0,0,0,0.5)] sm:h-32 sm:w-56 ${pipDragPosition ? "" : pipCornerClass} cursor-grab active:cursor-grabbing touch-none select-none`}
+                  className={`absolute z-30 h-28 w-44 overflow-hidden rounded-xl border border-[#fafafa]/20 bg-black/75 shadow-[0_16px_36px_rgba(0,0,0,0.5)] sm:h-32 sm:w-56 ${pipDragPosition ? "" : webinarPipCornerClass} cursor-grab active:cursor-grabbing touch-none select-none`}
                   style={
                     pipDragPosition
                       ? {
@@ -2087,22 +2183,59 @@ export default function MeetsMainContent({
                     key={webinarStage.pip.participant.userId}
                     participant={webinarStage.pip.participant}
                     displayName={webinarStage.pip.displayName}
-                    onAudioAutoplayBlocked={handleWebinarAudioAutoplayBlocked}
-                    onAudioPlaybackStarted={handleWebinarAudioPlaybackStarted}
-                    audioPlaybackAttemptToken={webinarAudioPlaybackAttempt}
+                    disableAudio
                   />
                 </div>
               ) : null}
             </div>
           ) : (
-            <div className="rounded-xl border border-white/10 bg-black/40 px-6 py-4 text-center">
-              <p className="text-sm text-[#fafafa]">
-                Waiting for the host to start speaking...
-              </p>
+            <div className="flex min-h-0 flex-1 items-center justify-center p-6">
+              <WebinarWaitingCard
+                attendeeCount={webinarConfig?.attendeeCount ?? 0}
+              />
             </div>
           )}
+
+          <WebinarViewerChrome
+            title={webinarTitle}
+            attendeeCount={webinarConfig?.attendeeCount ?? 0}
+            hasLiveStage={webinarStageIsLive}
+            speakerName={webinarStage?.main.displayName ?? null}
+            qaEnabled={webinarConfig?.qaEnabled !== false}
+            isQaOpen={isWebinarQaOpen}
+            unseenQaCount={unseenWebinarQaCount}
+            onToggleQa={handleToggleWebinarQa}
+            isHandRaised={isWebinarHandRaised}
+            onToggleHand={
+              onSetWebinarHandRaised ? handleToggleWebinarHand : undefined
+            }
+            stageContainerRef={webinarStageRef}
+            onLeave={leaveRoom}
+          />
+
+          {isWebinarQaOpen ? (
+            <WebinarQaPanel
+              entries={webinarQaEntries}
+              qaEnabled={webinarConfig?.qaEnabled !== false}
+              currentUserId={currentUserId}
+              onClose={handleToggleWebinarQa}
+              onSubmit={onSubmitWebinarQuestion}
+              onUpvote={onUpvoteWebinarQuestion}
+            />
+          ) : null}
+
+          {webinarStageInvite &&
+          onAcceptWebinarStageInvite &&
+          onDismissWebinarStageInvite ? (
+            <WebinarStageInviteDialog
+              promotedByName={webinarStageInvite.promotedByName}
+              onAccept={onAcceptWebinarStageInvite}
+              onDismiss={onDismissWebinarStageInvite}
+            />
+          ) : null}
+
           {webinarAudioBlocked && (
-            <div className="absolute inset-0 z-30 flex items-center justify-center bg-black/65 p-4 backdrop-blur-sm">
+            <div className="absolute inset-0 z-40 flex items-center justify-center bg-black/65 p-4 backdrop-blur-sm">
               <div className="w-full max-w-sm rounded-2xl border border-[#fafafa]/20 bg-[#131316]/95 p-6 text-center shadow-2xl">
                 <p
                   className="text-sm uppercase tracking-[0.2em] text-[#fafafa]"
@@ -2252,15 +2385,7 @@ export default function MeetsMainContent({
       )}
 
       {isJoined &&
-        (isWebinarAttendee ? (
-          <div className="flex items-center justify-between gap-3 rounded-2xl border border-white/10 bg-black/30 px-4 py-3">
-            <div>
-              <p className="text-xs text-[#fafafa]/82">
-                {webinarConfig?.attendeeCount ?? 0} attendees watching
-              </p>
-            </div>
-          </div>
-        ) : (
+        (isWebinarAttendee ? null : (
           <div className="safe-area-pb flex w-full flex-col items-center gap-2">
             <ControlsBar {...controlsBarProps} />
             <CommandPalette
@@ -2362,6 +2487,13 @@ export default function MeetsMainContent({
           onPendingUserStale={handlePendingUserStale}
           hostUserId={hostUserId}
           hostUserIds={hostUserIds}
+          webinarEnabled={Boolean(webinarConfig?.enabled)}
+          webinarAttendeeCount={webinarConfig?.attendeeCount ?? 0}
+          webinarQaEntries={webinarQaEntries}
+          webinarHandQueue={webinarHandQueue}
+          onModerateWebinarQuestion={onModerateWebinarQuestion}
+          onPromoteWebinarAttendee={onPromoteWebinarAttendee}
+          onDemoteWebinarParticipant={onDemoteWebinarParticipant}
         />
       )}
 

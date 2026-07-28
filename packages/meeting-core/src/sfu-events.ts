@@ -119,6 +119,15 @@ export const SFU_EVENTS = {
     webinarGenerateLink: "webinar:generateLink",
     webinarRotateLink: "webinar:rotateLink",
 
+    // Webinar interaction (attendee Q&A, stage invites)
+    webinarQaSubmit: "webinar:qa:submit",
+    webinarQaUpvote: "webinar:qa:upvote",
+    webinarQaModerate: "webinar:qa:moderate",
+    webinarSetHandRaised: "webinar:setHandRaised",
+    webinarDeclineStage: "webinar:declineStage",
+    webinarPromoteAttendee: "webinar:promoteAttendee",
+    webinarDemoteParticipant: "webinar:demoteParticipant",
+
     // Admin namespace (elevated)
     adminAdmitAllPending: "admin:admitAllPending",
     adminRejectAllPending: "admin:rejectAllPending",
@@ -229,6 +238,11 @@ export const SFU_EVENTS = {
     webinarFeedChanged: "webinar:feedChanged",
     webinarParticipantJoined: "webinar:participantJoined",
     webinarAttendeeCountChanged: "webinar:attendeeCountChanged",
+    webinarQaChanged: "webinar:qaChanged",
+    webinarQaSnapshot: "webinar:qaSnapshot",
+    webinarHandQueueChanged: "webinar:handQueueChanged",
+    webinarPromoted: "webinar:promoted",
+    webinarDemoted: "webinar:demoted",
 
     // Meeting / webinar config broadcasts
     meetingConfigChanged: "meeting:configChanged",

@@ -53,9 +53,17 @@ import type {
   VideoQuality,
   WebcamCodecPolicy,
   WebinarConfigSnapshot,
+  WebinarDemotedNotification,
   WebinarFeedChangedNotification,
+  WebinarHandQueueChangedNotification,
+  WebinarHandQueueEntry,
   WebinarLinkResponse,
   WebinarParticipantJoinedNotification,
+  WebinarPromotedNotification,
+  WebinarQaChangedNotification,
+  WebinarQaEntry,
+  WebinarQaModerateRequest,
+  WebinarQaSnapshot,
   ServerRestartNotification,
   WebinarUpdateRequest,
 } from "../lib/types";
@@ -881,6 +889,15 @@ interface UseMeetSocketOptions {
   >;
   setWebinarRole: (role: "attendee" | "participant" | "host" | null) => void;
   setWebinarSpeakerUserId: (userId: string | null) => void;
+  setWebinarQaEntries: React.Dispatch<React.SetStateAction<WebinarQaEntry[]>>;
+  setWebinarHandQueue: React.Dispatch<
+    React.SetStateAction<WebinarHandQueueEntry[]>
+  >;
+  setIsWebinarHandRaised: (raised: boolean) => void;
+  setWebinarStageInvite: (
+    invite: { promotedByName?: string; rejoinRoomId: string } | null,
+  ) => void;
+  onWebinarDemoted?: (notification: WebinarDemotedNotification) => void;
   isMuted: boolean;
   setIsMuted: (value: boolean) => void;
   isCameraOff: boolean;
@@ -988,6 +1005,11 @@ export function useMeetSocket({
   setWebinarConfig,
   setWebinarRole,
   setWebinarSpeakerUserId,
+  setWebinarQaEntries,
+  setWebinarHandQueue,
+  setIsWebinarHandRaised,
+  setWebinarStageInvite,
+  onWebinarDemoted,
   isMuted,
   setIsMuted,
   isCameraOff,
@@ -1894,6 +1916,10 @@ export function useMeetSocket({
         setHostUserIds([]);
         setWebinarRole(null);
         setWebinarSpeakerUserId(null);
+        setWebinarQaEntries([]);
+        setWebinarHandQueue([]);
+        setIsWebinarHandRaised(false);
+        setWebinarStageInvite(null);
         participantIdsRef.current = new Set([userId]);
         departedParticipantIdsRef.current.clear();
         webinarJoinedParticipantIdsRef.current.clear();
@@ -2026,6 +2052,10 @@ export function useMeetSocket({
       setHostUserIds,
       setWebinarRole,
       setWebinarSpeakerUserId,
+      setWebinarQaEntries,
+      setWebinarHandQueue,
+      setIsWebinarHandRaised,
+      setWebinarStageInvite,
       setIsTtsDisabled,
       setIsDmEnabled,
       setAreImageAttachmentsEnabled,
@@ -6610,7 +6640,9 @@ export function useMeetSocket({
               );
               setWebinarRole(response.webinarRole ?? null);
               setWebinarSpeakerUserId(
-                response.existingProducers?.[0]?.producerUserId ?? null,
+                response.webinarSpeakerUserId ??
+                  response.existingProducers?.[0]?.producerUserId ??
+                  null,
               );
               setWebinarConfig((previous) => ({
                 enabled: response.isWebinarEnabled ?? previous?.enabled ?? false,
@@ -6630,6 +6662,8 @@ export function useMeetSocket({
                   false,
                 linkSlug: previous?.linkSlug ?? null,
                 feedMode: previous?.feedMode ?? "active-speaker",
+                qaEnabled:
+                  response.webinarQaEnabled ?? previous?.qaEnabled ?? true,
               }));
               currentRoomIdRef.current = targetRoomId;
               serverRoomIdRef.current = response.roomId ?? targetRoomId;
@@ -6671,8 +6705,13 @@ export function useMeetSocket({
                 setServerActiveSpeakerAvailable(false);
               }
               setWebinarRole(response.webinarRole ?? null);
+              // The server clears an attendee's raised hand whenever their
+              // seat is replaced, so a (re)join always starts lowered.
+              setIsWebinarHandRaised(false);
               setWebinarSpeakerUserId(
-                response.existingProducers?.[0]?.producerUserId ?? null,
+                response.webinarSpeakerUserId ??
+                  response.existingProducers?.[0]?.producerUserId ??
+                  null,
               );
               setWebinarConfig((previous) => ({
                 enabled: response.isWebinarEnabled ?? previous?.enabled ?? false,
@@ -6692,6 +6731,8 @@ export function useMeetSocket({
                   false,
                 linkSlug: previous?.linkSlug ?? null,
                 feedMode: previous?.feedMode ?? "active-speaker",
+                qaEnabled:
+                  response.webinarQaEnabled ?? previous?.qaEnabled ?? true,
               }));
               if (Array.isArray(response.displayNameSnapshot)) {
                 applyDisplayNameSnapshot(response.displayNameSnapshot);
@@ -6841,6 +6882,7 @@ export function useMeetSocket({
       setWebinarConfig,
       setWebinarRole,
       setWebinarSpeakerUserId,
+      setIsWebinarHandRaised,
       currentRoomIdRef,
       applyDisplayNameSnapshot,
       deviceRef,
@@ -8354,6 +8396,7 @@ export function useMeetSocket({
                   requiresInviteCode: previous?.requiresInviteCode ?? false,
                   linkSlug: previous?.linkSlug ?? null,
                   feedMode: previous?.feedMode ?? "active-speaker",
+                  qaEnabled: previous?.qaEnabled ?? true,
                 }));
               },
             );
@@ -8383,6 +8426,79 @@ export function useMeetSocket({
                 ) {
                   void syncProducers();
                 }
+              },
+            );
+
+            socket.on(
+              "webinar:qaSnapshot",
+              (snapshot: WebinarQaSnapshot) => {
+                if (!isRoomEvent(snapshot.roomId)) return;
+                setWebinarQaEntries(
+                  [...(snapshot.entries ?? [])].sort(
+                    (a, b) => a.askedAt - b.askedAt,
+                  ),
+                );
+              },
+            );
+
+            socket.on(
+              "webinar:qaChanged",
+              (notification: WebinarQaChangedNotification) => {
+                if (!isRoomEvent(notification.roomId)) return;
+                setWebinarQaEntries((previous) => {
+                  if (notification.removedId) {
+                    return previous.filter(
+                      (entry) => entry.id !== notification.removedId,
+                    );
+                  }
+                  const entry = notification.entry;
+                  if (!entry) return previous;
+                  const existingIndex = previous.findIndex(
+                    (candidate) => candidate.id === entry.id,
+                  );
+                  if (existingIndex === -1) {
+                    return [...previous, entry].sort(
+                      (a, b) => a.askedAt - b.askedAt,
+                    );
+                  }
+                  const next = previous.slice();
+                  // Server broadcasts omit per-viewer vote state; keep ours.
+                  next[existingIndex] = {
+                    ...entry,
+                    hasUpvoted:
+                      entry.hasUpvoted ?? previous[existingIndex].hasUpvoted,
+                  };
+                  return next;
+                });
+              },
+            );
+
+            socket.on(
+              "webinar:handQueueChanged",
+              (notification: WebinarHandQueueChangedNotification) => {
+                if (!isRoomEvent(notification.roomId)) return;
+                setWebinarHandQueue(notification.queue ?? []);
+              },
+            );
+
+            socket.on(
+              "webinar:promoted",
+              (notification: WebinarPromotedNotification) => {
+                if (joinMode !== "webinar_attendee") return;
+                if (!isRoomEvent(notification.roomId)) return;
+                setWebinarStageInvite({
+                  promotedByName: notification.promotedByName,
+                  rejoinRoomId: notification.rejoinRoomId,
+                });
+              },
+            );
+
+            socket.on(
+              "webinar:demoted",
+              (notification: WebinarDemotedNotification) => {
+                if (joinMode === "webinar_attendee") return;
+                if (!isRoomEvent(notification.roomId)) return;
+                onWebinarDemoted?.(notification);
               },
             );
 
@@ -8506,6 +8622,10 @@ export function useMeetSocket({
       setWebinarRole,
       setWebinarSpeakerUserId,
       setWebinarConfig,
+      setWebinarQaEntries,
+      setWebinarHandQueue,
+      setWebinarStageInvite,
+      onWebinarDemoted,
       setServerRestartNotice,
       setAdminNotice,
       setServerActiveSpeakerAvailable,
@@ -9628,6 +9748,178 @@ export function useMeetSocket({
     [socketRef],
   );
 
+  const submitWebinarQuestion = useCallback(
+    (question: string): Promise<{ ok: boolean; error?: string }> => {
+      const socket = socketRef.current;
+      if (!socket) return Promise.resolve({ ok: false, error: "Not connected" });
+
+      return new Promise((resolve) => {
+        socket.emit(
+          "webinar:qa:submit",
+          { question },
+          (response: { success: boolean } | { error: string }) => {
+            if ("error" in response) {
+              resolve({ ok: false, error: response.error });
+              return;
+            }
+            resolve({ ok: true });
+          },
+        );
+      });
+    },
+    [socketRef],
+  );
+
+  const upvoteWebinarQuestion = useCallback(
+    (id: string): void => {
+      const socket = socketRef.current;
+      if (!socket) return;
+      // Optimistic flip; the ack corrects the count if it diverged.
+      setWebinarQaEntries((previous) =>
+        previous.map((entry) =>
+          entry.id === id
+            ? {
+                ...entry,
+                hasUpvoted: !entry.hasUpvoted,
+                upvotes: Math.max(0, entry.upvotes + (entry.hasUpvoted ? -1 : 1)),
+              }
+            : entry,
+        ),
+      );
+      socket.emit(
+        "webinar:qa:upvote",
+        { id },
+        (
+          response:
+            | { success: boolean; upvotes: number; hasUpvoted: boolean }
+            | { error: string },
+        ) => {
+          if ("error" in response) {
+            // Roll the optimistic flip back so a rate-limited click cannot
+            // leave the count and vote state diverged from the server.
+            setWebinarQaEntries((previous) =>
+              previous.map((entry) =>
+                entry.id === id
+                  ? {
+                      ...entry,
+                      hasUpvoted: !entry.hasUpvoted,
+                      upvotes: Math.max(
+                        0,
+                        entry.upvotes + (entry.hasUpvoted ? -1 : 1),
+                      ),
+                    }
+                  : entry,
+              ),
+            );
+            return;
+          }
+          setWebinarQaEntries((previous) =>
+            previous.map((entry) =>
+              entry.id === id
+                ? {
+                    ...entry,
+                    upvotes: response.upvotes,
+                    hasUpvoted: response.hasUpvoted,
+                  }
+                : entry,
+            ),
+          );
+        },
+      );
+    },
+    [socketRef, setWebinarQaEntries],
+  );
+
+  const moderateWebinarQuestion = useCallback(
+    (request: WebinarQaModerateRequest): Promise<{ ok: boolean; error?: string }> => {
+      const socket = socketRef.current;
+      if (!socket) return Promise.resolve({ ok: false, error: "Not connected" });
+
+      return new Promise((resolve) => {
+        socket.emit(
+          "webinar:qa:moderate",
+          request,
+          (response: { success: boolean } | { error: string }) => {
+            if ("error" in response) {
+              resolve({ ok: false, error: response.error });
+              return;
+            }
+            resolve({ ok: true });
+          },
+        );
+      });
+    },
+    [socketRef],
+  );
+
+  const setWebinarHandRaisedRemote = useCallback(
+    (raised: boolean): void => {
+      const socket = socketRef.current;
+      if (!socket) return;
+      setIsWebinarHandRaised(raised);
+      socket.emit(
+        "webinar:setHandRaised",
+        { raised },
+        (response: { success: boolean; raised: boolean } | { error: string }) => {
+          if ("error" in response) {
+            setIsWebinarHandRaised(!raised);
+            return;
+          }
+          setIsWebinarHandRaised(response.raised);
+        },
+      );
+    },
+    [socketRef, setIsWebinarHandRaised],
+  );
+
+  const declineWebinarStageInvite = useCallback((): void => {
+    socketRef.current?.emit("webinar:declineStage", () => {});
+  }, [socketRef]);
+
+  const promoteWebinarAttendee = useCallback(
+    (userId: string): Promise<{ ok: boolean; error?: string }> => {
+      const socket = socketRef.current;
+      if (!socket) return Promise.resolve({ ok: false, error: "Not connected" });
+
+      return new Promise((resolve) => {
+        socket.emit(
+          "webinar:promoteAttendee",
+          { userId },
+          (response: { success: boolean } | { error: string }) => {
+            if ("error" in response) {
+              resolve({ ok: false, error: response.error });
+              return;
+            }
+            resolve({ ok: true });
+          },
+        );
+      });
+    },
+    [socketRef],
+  );
+
+  const demoteWebinarParticipant = useCallback(
+    (userId: string): Promise<{ ok: boolean; error?: string }> => {
+      const socket = socketRef.current;
+      if (!socket) return Promise.resolve({ ok: false, error: "Not connected" });
+
+      return new Promise((resolve) => {
+        socket.emit(
+          "webinar:demoteParticipant",
+          { userId },
+          (response: { success: boolean } | { error: string }) => {
+            if ("error" in response) {
+              resolve({ ok: false, error: response.error });
+              return;
+            }
+            resolve({ ok: true });
+          },
+        );
+      });
+    },
+    [socketRef],
+  );
+
   return {
     cleanup,
     cleanupRoomResources,
@@ -9652,5 +9944,12 @@ export function useMeetSocket({
     updateWebinarConfig,
     rotateWebinarLink,
     generateWebinarLink,
+    submitWebinarQuestion,
+    upvoteWebinarQuestion,
+    moderateWebinarQuestion,
+    setWebinarHandRaisedRemote,
+    declineWebinarStageInvite,
+    promoteWebinarAttendee,
+    demoteWebinarParticipant,
   };
 }

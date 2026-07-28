@@ -208,8 +208,11 @@ const getDefaultConsumerLayers = (
     return undefined;
   }
 
+  // Webinar attendees watch one full-screen program feed, so they get the top
+  // simulcast layer (the default) — a viewer's downlink carries a single
+  // video either way, and a 180p stage reads as broken to the audience.
   if (client.isWebinarAttendee) {
-    return { spatialLayer: 0, temporalLayer: 0 };
+    return undefined;
   }
 
   if (room.currentQuality === "low") {
@@ -994,6 +997,21 @@ export const registerMediaHandlers = (context: ConnectionContext): void => {
         if (!producerInfo) {
           respond(callback, { error: "Producer not found" });
           return;
+        }
+        // Attendees may only consume the curated program feed. Without this,
+        // a modified viewer could subscribe to any producer id it learns.
+        if (currentClient.isWebinarAttendee) {
+          const allowedFeedProducerIds = new Set(
+            room
+              .getWebinarFeedSnapshot()
+              .producers.map((feedProducer) => feedProducer.producerId),
+          );
+          if (!allowedFeedProducerIds.has(producerId)) {
+            respond(callback, {
+              error: "This stream is not part of the webinar feed",
+            });
+            return;
+          }
         }
         if (!room.producerIdMatchesCurrentWebcamCodecPolicy(producerId)) {
           respond(callback, {

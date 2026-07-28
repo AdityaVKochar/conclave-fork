@@ -80,6 +80,13 @@ final class CallAudioSession {
         activateSession()
     }
 
+    /// Keep the active WebRTC audio session armed while SwiftUI moves the app
+    /// into the background. This is intentionally a no-op outside a call.
+    func maintainBackgroundCall() {
+        guard isCallActive else { return }
+        activateSession()
+    }
+
     func setRouteReassertionHandler(_ handler: (() -> Void)?) {
         routeReassertionHandler = handler
     }
@@ -161,18 +168,12 @@ final class CallAudioSession {
         case .began:
             debugLog("[CallAudio] interruption began")
         case .ended:
-            // The interruption ended - re-activate audio if the system says we
-            // should resume (and we're still in a call).
+            // For an established call, always reclaim the audio session after
+            // the interruption ends. `shouldResume` is advisory and is often
+            // absent (or false) after Siri, alarms and route transitions even
+            // though the call itself is still live.
             debugLog("[CallAudio] interruption ended")
-            if let optionsValue = info[AVAudioSessionInterruptionOptionKey] as? UInt {
-                let options = AVAudioSession.InterruptionOptions(rawValue: optionsValue)
-                if options.contains(.shouldResume) {
-                    scheduleActivationReassertion()
-                }
-            } else {
-                // No options provided - best-effort re-activate while in a call.
-                scheduleActivationReassertion()
-            }
+            scheduleActivationReassertion()
         @unknown default:
             break
         }

@@ -44,8 +44,9 @@ struct MeetingBannerOverlay: View {
     @State private var dismissedQualitySeverity: Int = 0
 
     private var isRecovering: Bool {
-        viewModel.state.isRecoveringConnection ||
-            viewModel.state.connectionState == ConnectionState.reconnecting
+        !viewModel.state.isResumingFromBackground &&
+            (viewModel.state.isRecoveringConnection ||
+                viewModel.state.connectionState == ConnectionState.reconnecting)
     }
     private var isOffline: Bool {
         viewModel.state.isNetworkOffline

@@ -114,6 +114,18 @@ const makeHarness = (
       type: options.producerType ?? "webcam",
       paused: false,
     }),
+    getWebinarFeedSnapshot: vi.fn().mockReturnValue({
+      speakerUserId: "owner",
+      producers: [
+        {
+          producerId: "producer",
+          producerUserId: "owner",
+          kind: "video",
+          type: options.producerType ?? "webcam",
+          paused: false,
+        },
+      ],
+    }),
     producerIdMatchesCurrentWebcamCodecPolicy: vi.fn().mockReturnValue(true),
     canConsume: vi.fn().mockReturnValue(true),
   } as unknown as Room;
@@ -135,17 +147,8 @@ const makeHarness = (
 };
 
 describe("current consumer generation controls", () => {
-  it.each([
-    {
-      name: "a low-quality room",
-      harness: { roomQuality: "low" as const },
-    },
-    {
-      name: "a webinar attendee",
-      harness: { clientMode: "webinar_attendee" as const },
-    },
-  ])("defaults T1 webcam consumers to temporal layer zero for $name", async ({ harness }) => {
-    const { client, handlers } = makeHarness(harness);
+  it("defaults T1 webcam consumers to temporal layer zero for a low-quality room", async () => {
+    const { client, handlers } = makeHarness({ roomQuality: "low" });
     const consumer = makeConsumer("consumer-webcam");
     client.consumerTransport = {
       id: "recv-transport",
@@ -166,6 +169,36 @@ describe("current consumer generation controls", () => {
       spatialLayer: 0,
       temporalLayer: 0,
     });
+  });
+
+  it("lets webinar attendees consume the full-quality program feed", async () => {
+    const { client, handlers } = makeHarness({
+      clientMode: "webinar_attendee",
+    });
+    const consumer = makeConsumer("consumer-webcam");
+    client.consumerTransport = {
+      id: "recv-transport",
+      consume: vi.fn().mockResolvedValue(consumer),
+    } as unknown as WebRtcTransport;
+    const handler = handlers.get("consume") as unknown as ConsumeHandler;
+
+    const callback = vi.fn();
+    await handler(
+      {
+        transportId: "recv-transport",
+        producerId: "producer",
+        rtpCapabilities: {},
+      },
+      callback,
+    );
+
+    // Attendees watch one full-screen stage video; capping them to the lowest
+    // simulcast layer made the webinar look broken. Top layer is the default.
+    expect(client.consumerTransport.consume).toHaveBeenCalledOnce();
+    expect(callback).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "consumer-webcam" }),
+    );
+    expect(consumer.setPreferredLayers).not.toHaveBeenCalled();
   });
 
   it("keeps the screen-share temporal default unchanged", async () => {

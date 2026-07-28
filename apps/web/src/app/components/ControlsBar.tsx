@@ -890,7 +890,6 @@ function ControlsBar(props: ControlsBarProps) {
             label: "Host controls",
             showTooltipWithoutHotkey: true,
             variant: isHostControlsOpen ? "active" : "default",
-            badge: props.pendingUsersCount,
             onPress: onToggleHostControls,
           },
         }

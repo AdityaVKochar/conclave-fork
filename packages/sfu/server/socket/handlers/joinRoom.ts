@@ -124,6 +124,24 @@ export const registerJoinRoomHandler = (context: ConnectionContext): void => {
           return;
         }
         const clientId = canonicalizeClientId(tokenClientId);
+
+        const identity = buildUserIdentity(user ?? {}, sessionId, socket.id);
+        if (!identity) {
+          respond(callback, {
+            error: "Authentication error: Invalid token payload",
+          });
+          return;
+        }
+        const tokenSessionId = normalizeIdentifier(
+          user?.sessionId,
+          MAX_SESSION_ID_LENGTH,
+        );
+        if (tokenSessionId && sessionId && tokenSessionId !== sessionId) {
+          respond(callback, { error: "Session mismatch" });
+          return;
+        }
+        const { userKey, userId } = identity;
+
         let roomId = requestedRoomId;
         let scheduledWebinarForAttendee: ReturnType<
           typeof resolveScheduledWebinarAttendeeEntry
@@ -204,10 +222,42 @@ export const registerJoinRoomHandler = (context: ConnectionContext): void => {
           Boolean(scheduledWebinarForRoom) &&
           scheduledWebinarForRoom?.status !== "ended" &&
           scheduledWebinarForRoom?.status !== "cancelled";
+        // A host invite ("bring on stage") lets an attendee identity rejoin as
+        // a full participant; the promotion registry lives on the live room.
+        // Honored only while webinar mode is on, so a stale invite can never
+        // bypass an ordinary meeting's lock or invite code later.
+        const isWebinarPromotedJoin =
+          !isWebinarAttendeeJoin &&
+          Boolean(preexistingWebinarConfig?.enabled) &&
+          Boolean(
+            state.rooms
+              .get(resolvedChannelId)
+              ?.isWebinarPromotedUserKey(userKey),
+          );
         if (
           isActiveScheduledWebinarRoom &&
           !forcedHostJoin &&
-          !hostRequested
+          !hostRequested &&
+          !isWebinarPromotedJoin
+        ) {
+          respond(callback, {
+            error: "Use the public webinar link to join as an attendee.",
+          });
+          return;
+        }
+        // A speaker the host moved back to the audience cannot re-enter as a
+        // participant while webinar mode is on; the audience link is the way
+        // back in (a fresh stage invite clears the mark).
+        if (
+          !isWebinarAttendeeJoin &&
+          !forcedHostJoin &&
+          !hostRequested &&
+          Boolean(preexistingWebinarConfig?.enabled) &&
+          Boolean(
+            state.rooms
+              .get(resolvedChannelId)
+              ?.isWebinarDemotedUserKey(userKey),
+          )
         ) {
           respond(callback, {
             error: "Use the public webinar link to join as an attendee.",
@@ -225,23 +275,6 @@ export const registerJoinRoomHandler = (context: ConnectionContext): void => {
           return;
         }
 
-        const identity = buildUserIdentity(user ?? {}, sessionId, socket.id);
-        if (!identity) {
-          respond(callback, {
-            error: "Authentication error: Invalid token payload",
-          });
-          return;
-        }
-        const tokenSessionId = normalizeIdentifier(
-          user?.sessionId,
-          MAX_SESSION_ID_LENGTH,
-        );
-        if (tokenSessionId && sessionId && tokenSessionId !== sessionId) {
-          respond(callback, { error: "Session mismatch" });
-          return;
-        }
-
-        const { userKey, userId } = identity;
         const roomChannelId = getRoomChannelId(clientId, roomId);
         let room = state.rooms.get(roomChannelId);
         let createdRoom = false;
@@ -500,6 +533,7 @@ export const registerJoinRoomHandler = (context: ConnectionContext): void => {
         const shouldValidateMeetingInviteCode =
           !isWebinarAttendeeJoin &&
           !hasPrivilegedJoinAccess &&
+          !isWebinarPromotedJoin &&
           requiresMeetingInviteCode &&
           !isSameSessionMeetingParticipantRejoin;
 
@@ -528,6 +562,7 @@ export const registerJoinRoomHandler = (context: ConnectionContext): void => {
           !isWebinarAttendeeJoin &&
           room.noGuests &&
           !hasPrivilegedJoinAccess &&
+          !isWebinarPromotedJoin &&
           isGuestUserKey(userKey)
         ) {
           Logger.info(
@@ -563,6 +598,7 @@ export const registerJoinRoomHandler = (context: ConnectionContext): void => {
           !isWebinarAttendeeJoin &&
           room.isLocked &&
           !hasPrivilegedJoinAccess &&
+          !isWebinarPromotedJoin &&
           !room.isLockedAllowed(userKey)
         ) {
           Logger.info(
@@ -612,6 +648,7 @@ export const registerJoinRoomHandler = (context: ConnectionContext): void => {
           !isWebinarAttendeeJoin &&
           clientPolicy.useWaitingRoom &&
           !hasPrivilegedJoinAccess &&
+          !isWebinarPromotedJoin &&
           !room.isAllowed(userKey) &&
           !(room.isLocked && room.isLockedAllowed(userKey))
         ) {
@@ -838,6 +875,28 @@ export const registerJoinRoomHandler = (context: ConnectionContext): void => {
           emitChatHistorySnapshot(socket, context.currentRoom);
         }
 
+        const isModeratorClient =
+          context.currentClient instanceof Admin &&
+          !context.currentClient.isObserver;
+        if (
+          webinarConfig.enabled &&
+          (isModeratorClient || context.currentClient.isWebinarAttendee)
+        ) {
+          socket.emit("webinar:qaSnapshot", {
+            roomId: context.currentRoom.id,
+            entries: context.currentRoom.getWebinarQaSnapshotFor(
+              userId,
+              isModeratorClient,
+            ),
+          });
+        }
+        if (webinarConfig.enabled && isModeratorClient) {
+          socket.emit("webinar:handQueueChanged", {
+            roomId: context.currentRoom.id,
+            queue: context.currentRoom.getWebinarHandQueue(),
+          });
+        }
+
         socket.emit("roomLockChanged", {
           locked: context.currentRoom.isLocked,
           roomId: context.currentRoom.id,
@@ -967,6 +1026,10 @@ export const registerJoinRoomHandler = (context: ConnectionContext): void => {
           webinarRequiresInviteCode: webinarSnapshot.requiresInviteCode,
           webinarAttendeeCount: webinarSnapshot.attendeeCount,
           webinarMaxAttendees: webinarSnapshot.maxAttendees,
+          webinarQaEnabled: webinarSnapshot.qaEnabled,
+          ...(context.currentClient.isWebinarAttendee
+            ? { webinarSpeakerUserId: feedSnapshot.speakerUserId }
+            : {}),
           webcamCodecPolicy: context.currentRoom.webcamCodecPolicy,
         });
       } catch (error) {

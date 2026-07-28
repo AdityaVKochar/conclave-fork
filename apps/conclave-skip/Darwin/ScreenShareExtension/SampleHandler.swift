@@ -30,7 +30,8 @@ final class SampleHandler: RPBroadcastSampleHandler {
     return CIContext(options: [
       CIContextOption.workingColorSpace: outputColorSpace,
       CIContextOption.outputColorSpace: outputColorSpace,
-      CIContextOption.useSoftwareRenderer: true,
+      CIContextOption.useSoftwareRenderer: false,
+      CIContextOption.cacheIntermediates: false,
     ])
   }()
   private var socketConnection: ScreenShareSocketConnection?
@@ -46,7 +47,21 @@ final class SampleHandler: RPBroadcastSampleHandler {
   private var sentFrameCount: Int = 0
   private var droppedFrameCount: Int = 0
   private var lastFrameSentAt: TimeInterval = 0
-  private let minFrameInterval: TimeInterval = 1.0 / 12.0
+  private var minFrameInterval: TimeInterval = 1.0 / 24.0
+  private var publishMaxWidth = 3_840
+  private var publishMaxHeight = 2_160
+  private var publishMaxBitrateBps = 2_500_000
+  private var publishContentHint = "detail"
+  private var jpegCompressionQuality = 0.68
+  private let publishFrameRateKey = "conclave.screenShare.maxFrameRate"
+  private let publishMaxWidthKey = "conclave.screenShare.maxWidth"
+  private let publishMaxHeightKey = "conclave.screenShare.maxHeight"
+  private let publishMaxBitrateKey = "conclave.screenShare.maxBitrateBps"
+  private let publishContentHintKey = "conclave.screenShare.contentHint"
+  private let lifecycleStateKey = "conclave.screenShare.lifecycle.state"
+  private let lifecycleUpdatedAtKey = "conclave.screenShare.lifecycle.updatedAt"
+  private let stopRequestedAtKey = "conclave.screenShare.lifecycle.stopRequestedAt"
+  private var broadcastStartedAt: TimeInterval = 0
 
   private func log(_ message: String, _ metadata: [String: Any] = [:]) {
     if metadata.isEmpty {
@@ -72,6 +87,9 @@ final class SampleHandler: RPBroadcastSampleHandler {
     sentFrameCount = 0
     droppedFrameCount = 0
     lastFrameSentAt = 0
+    broadcastStartedAt = Date().timeIntervalSince1970
+    publishLifecycleState("starting")
+    reloadPublishConfiguration()
     socketConnection = ScreenShareSocketConnection(appGroupIdentifier: appGroupIdentifier)
     if socketConnection == nil {
       log("Failed to initialize socket connection", ["reason": "container URL unavailable"])
@@ -80,16 +98,19 @@ final class SampleHandler: RPBroadcastSampleHandler {
     hasConnectedAtLeastOnce = isConnected
     disconnectedSince = isConnected ? nil : Date().timeIntervalSince1970
     lastConnectionAttempt = Date().timeIntervalSince1970
+    publishLifecycleState(isConnected ? "active" : "reconnecting")
   }
 
   override func broadcastFinished() {
+    publishLifecycleState("stopped")
     socketConnection?.close()
     socketConnection = nil
     isConnected = false
     hasConnectedAtLeastOnce = false
     disconnectedSince = nil
-    didFinishBroadcast = false
+    didFinishBroadcast = true
     lastConnectionAttempt = 0
+    broadcastStartedAt = 0
   }
 
   override func processSampleBuffer(
@@ -98,7 +119,14 @@ final class SampleHandler: RPBroadcastSampleHandler {
   ) {
     guard !didFinishBroadcast else { return }
     guard sampleBufferType == .video else { return }
+    if wasStopRequestedByMainApp() {
+      finishDueToConnectionLoss(message: "Screen sharing stopped.", intentional: true)
+      return
+    }
     videoSampleCount += 1
+    if videoSampleCount % 30 == 0 {
+      reloadPublishConfiguration()
+    }
 
     let now = Date().timeIntervalSince1970
     if lastFrameSentAt > 0 && now - lastFrameSentAt < minFrameInterval {
@@ -129,6 +157,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
         if isConnected {
           hasConnectedAtLeastOnce = true
           disconnectedSince = nil
+          publishLifecycleState("active")
           log("Socket reconnected", ["videoSampleCount": videoSampleCount])
         }
       }
@@ -162,7 +191,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
       let height = CVPixelBufferGetHeight(imageBuffer)
       let orientation = SampleHandler.extractOrientation(from: sampleBuffer)
 
-      guard let imageData = makeJPEGData(
+      guard let encodedFrame = makeJPEGData(
         from: imageBuffer,
         orientation: orientation
       ) else {
@@ -176,16 +205,16 @@ final class SampleHandler: RPBroadcastSampleHandler {
       }
 
       guard let messageData = SampleHandler.wrap(
-        imageData: imageData,
-        width: width,
-        height: height,
+        imageData: encodedFrame.data,
+        width: encodedFrame.width,
+        height: encodedFrame.height,
         orientation: orientation
       ) else {
         log("Dropped frame: message wrapping failed", [
           "width": width,
           "height": height,
           "orientation": orientation,
-          "jpegBytes": imageData.count,
+          "jpegBytes": encodedFrame.data.count,
         ])
         return
       }
@@ -193,9 +222,9 @@ final class SampleHandler: RPBroadcastSampleHandler {
       guard socketConnection?.write(messageData) == true else {
         log("Socket write failed", [
           "messageBytes": messageData.count,
-          "jpegBytes": imageData.count,
-          "width": width,
-          "height": height,
+          "jpegBytes": encodedFrame.data.count,
+          "width": encodedFrame.width,
+          "height": encodedFrame.height,
           "orientation": orientation,
           "videoSampleCount": videoSampleCount,
           "sentFrameCount": sentFrameCount,
@@ -204,16 +233,10 @@ final class SampleHandler: RPBroadcastSampleHandler {
         socketConnection?.close()
         socketConnection = nil
         isConnected = false
-
-        if hasConnectedAtLeastOnce {
-          log("Main app closed connection - finishing broadcast gracefully")
-          finishDueToConnectionLoss(message: "Screen sharing stopped.", intentional: true)
-          return
-        }
-
         if disconnectedSince == nil {
           disconnectedSince = Date().timeIntervalSince1970
         }
+        publishLifecycleState("reconnecting")
         log("Will retry socket reconnect after write failure", [
           "reconnectTimeout": reconnectTimeout,
           "initialConnectionTimeout": initialConnectionTimeout,
@@ -234,6 +257,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
     socketConnection?.close()
     socketConnection = nil
     isConnected = false
+    publishLifecycleState("stopped")
 
     if intentional {
       log("Intentional stop - finishing broadcast gracefully")
@@ -248,6 +272,44 @@ final class SampleHandler: RPBroadcastSampleHandler {
     DispatchQueue.main.async { [weak self] in
       self?.finishBroadcastWithError(error)
     }
+  }
+
+  private func reloadPublishConfiguration() {
+    guard let defaults = UserDefaults(suiteName: appGroupIdentifier) else { return }
+    let configuredFrameRate = defaults.double(forKey: publishFrameRateKey)
+    let frameRate = configuredFrameRate > 0 ? min(60.0, max(1.0, configuredFrameRate)) : 24.0
+    minFrameInterval = 1.0 / frameRate
+
+    let configuredWidth = defaults.integer(forKey: publishMaxWidthKey)
+    let configuredHeight = defaults.integer(forKey: publishMaxHeightKey)
+    let configuredBitrate = defaults.integer(forKey: publishMaxBitrateKey)
+    publishMaxWidth = configuredWidth > 0 ? min(3_840, max(320, configuredWidth)) : 3_840
+    publishMaxHeight = configuredHeight > 0 ? min(2_160, max(180, configuredHeight)) : 2_160
+    publishMaxBitrateBps = configuredBitrate > 0
+      ? min(15_000_000, max(150_000, configuredBitrate))
+      : 2_500_000
+    publishContentHint = defaults.string(forKey: publishContentHintKey) ?? "detail"
+
+    if publishContentHint == "text" {
+      jpegCompressionQuality = 0.82
+    } else if publishContentHint == "motion" {
+      jpegCompressionQuality = 0.62
+    } else {
+      jpegCompressionQuality = publishMaxBitrateBps >= 3_500_000 ? 0.74 : 0.68
+    }
+  }
+
+  private func wasStopRequestedByMainApp() -> Bool {
+    guard broadcastStartedAt > 0,
+      let defaults = UserDefaults(suiteName: appGroupIdentifier)
+    else { return false }
+    return defaults.double(forKey: stopRequestedAtKey) >= broadcastStartedAt
+  }
+
+  private func publishLifecycleState(_ state: String) {
+    guard let defaults = UserDefaults(suiteName: appGroupIdentifier) else { return }
+    defaults.set(state, forKey: lifecycleStateKey)
+    defaults.set(Date().timeIntervalSince1970, forKey: lifecycleUpdatedAtKey)
   }
 }
 
@@ -310,28 +372,48 @@ private extension SampleHandler {
 }
 
 private extension SampleHandler {
-  func makeJPEGData(from imageBuffer: CVImageBuffer, orientation: Int) -> Data? {
+  func makeJPEGData(
+    from imageBuffer: CVImageBuffer,
+    orientation: Int
+  ) -> (data: Data, width: Int, height: Int)? {
     let ciImage = CIImage(
       cvPixelBuffer: imageBuffer,
       options: [CIImageOption.colorSpace: outputColorSpace]
     )
+    let sourceWidth = max(1.0, ciImage.extent.width)
+    let sourceHeight = max(1.0, ciImage.extent.height)
+    let scale = max(
+      1.0,
+      sourceWidth / CGFloat(publishMaxWidth),
+      sourceHeight / CGFloat(publishMaxHeight)
+    )
+    let targetWidth = evenDimension(Int((sourceWidth / scale).rounded(.down)))
+    let targetHeight = evenDimension(Int((sourceHeight / scale).rounded(.down)))
+    let preparedImage: CIImage
+    if scale > 1.0 {
+      preparedImage = ciImage
+        .transformed(by: CGAffineTransform(scaleX: 1.0 / scale, y: 1.0 / scale))
+        .cropped(to: CGRect(x: 0, y: 0, width: targetWidth, height: targetHeight))
+    } else {
+      preparedImage = ciImage
+    }
     let compressionOptions: [CIImageRepresentationOption: Any] = [
-      kCGImageDestinationLossyCompressionQuality as CIImageRepresentationOption: 0.45
+      kCGImageDestinationLossyCompressionQuality as CIImageRepresentationOption: jpegCompressionQuality
     ]
 
     if let imageData = imageContext.jpegRepresentation(
-      of: ciImage,
+      of: preparedImage,
       colorSpace: outputColorSpace,
       options: compressionOptions
     ) {
-      return imageData
+      return (imageData, targetWidth, targetHeight)
     }
 
     log("jpegRepresentation failed; falling back to CGImageDestination", [
       "orientation": orientation,
     ])
 
-    guard let cgImage = imageContext.createCGImage(ciImage, from: ciImage.extent)
+    guard let cgImage = imageContext.createCGImage(preparedImage, from: preparedImage.extent)
     else {
       log("Dropped frame: createCGImage failed", [
         "orientation": orientation,
@@ -355,7 +437,7 @@ private extension SampleHandler {
     }
 
     let destinationOptions: [CFString: Any] = [
-      kCGImageDestinationLossyCompressionQuality: 0.45
+      kCGImageDestinationLossyCompressionQuality: jpegCompressionQuality
     ]
     CGImageDestinationAddImage(destination, cgImage, destinationOptions as CFDictionary)
     guard CGImageDestinationFinalize(destination) else {
@@ -365,6 +447,11 @@ private extension SampleHandler {
       return nil
     }
 
-    return data as Data
+    return (data as Data, targetWidth, targetHeight)
+  }
+
+  func evenDimension(_ value: Int) -> Int {
+    let dimension = max(2, value)
+    return dimension % 2 == 0 ? dimension : dimension - 1
   }
 }

@@ -25,7 +25,7 @@ enum TranscriptProvider: String, CaseIterable, Identifiable {
 
     var transcriptModel: String {
         switch self {
-        case .openAI: return "gpt-realtime-whisper"
+        case .openAI: return "gpt-live-transcribe"
         case .sarvam: return "saaras:v3"
         }
     }

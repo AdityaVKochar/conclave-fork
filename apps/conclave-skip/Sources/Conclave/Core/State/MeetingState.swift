@@ -123,6 +123,10 @@ final class MeetingState {
             )
         }
     }
+    /// True while a connected call is moving through an expected app
+    /// background/foreground transition. Transport recovery may briefly run,
+    /// but it should not be presented as a user-facing outage.
+    var isResumingFromBackground: Bool = false
     var errorMessage: String?
     var joinFormErrorMessage: String?
     var meetingEndedNoticeMessage: String?

@@ -66,6 +66,21 @@ final class WebRTCClient {
         receiveVideo: Bool
     ) async { fatalError() }
     func updateVideoQuality(_ quality: VideoQuality) { fatalError() }
+    func updateMediaPublishConfiguration(
+        cameraWidth: Int,
+        cameraHeight: Int,
+        cameraFrameRate: Int,
+        cameraMaxBitrateBps: Int,
+        cameraContentHint: String,
+        cameraDegradationPreference: String,
+        screenMaxWidth: Int,
+        screenMaxHeight: Int,
+        screenFrameRate: Int,
+        screenMaxBitrateBps: Int,
+        screenContentHint: String,
+        screenDegradationPreference: String
+    ) { fatalError() }
+    func refreshLocalMediaForQualitySettings() async { fatalError() }
     func applyLocalBandwidthProfile(connectionQuality: ConnectionQuality) { fatalError() }
     func refreshLocalAudioProducerForBandwidthProfile(connectionQuality: ConnectionQuality) async { fatalError() }
     func refreshLocalVideoProducerForBandwidthProfile(connectionQuality: ConnectionQuality) async { fatalError() }

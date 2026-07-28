@@ -536,7 +536,6 @@ export function buildControlsConfig(p: ControlsBarProps): ControlsConfig {
       icon: Shield,
       label: "Host controls",
       active: p.isHostControlsOpen,
-      badge: p.pendingUsersCount,
       onPress: p.onToggleHostControls,
     });
   }

@@ -526,6 +526,7 @@ final class MeetingViewModel {
     private var meetingLifecycleGeneration = 0
     private var reconnectAttempts = 0
     private var reconnectRetryTask: Task<Void, Never>?
+    private var foregroundResumePresentationTask: Task<Void, Never>?
     private var pendingIceRestartTasks: [String: Task<Void, Never>] = [:]
     private var participantConnectionStatusTasks: [String: Task<Void, Never>] = [:]
     private var remoteConsumerBandwidthPolicyTask: Task<Void, Never>?
@@ -2116,6 +2117,20 @@ final class MeetingViewModel {
         state.isRecoveringConnection = false
         recoveryStartedAt = nil
         stopRecoveryWatchdog()
+    }
+
+    private func scheduleForegroundResumePresentationRelease() {
+        foregroundResumePresentationTask?.cancel()
+        guard state.isResumingFromBackground else { return }
+        let lifecycleGeneration = meetingLifecycleGeneration
+        foregroundResumePresentationTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
+            guard !Task.isCancelled,
+                  let self,
+                  self.meetingLifecycleGeneration == lifecycleGeneration else { return }
+            self.state.isResumingFromBackground = false
+            self.foregroundResumePresentationTask = nil
+        }
     }
 
     // MARK: - Recovery watchdog
@@ -6712,9 +6727,16 @@ final class MeetingViewModel {
     }
 
     func handleAppBecameActive() {
+        #if canImport(UIKit) && !SKIP
+        ScreenCaptureManager.shared.reconcileBroadcastLifecycle()
+        #endif
         if restorePersistedMeetingIfNeeded() {
+            foregroundResumePresentationTask?.cancel()
+            foregroundResumePresentationTask = nil
+            state.isResumingFromBackground = false
             return
         }
+        scheduleForegroundResumePresentationRelease()
         let shouldRestoreRemoteVideo = !appForegroundAllowsRemoteVideoReceive
         if shouldRestoreRemoteVideo {
             webcamReceiverCapacityAuthorityGeneration += 1
@@ -6725,8 +6747,8 @@ final class MeetingViewModel {
         case .waiting:
             let context = currentSocketEventContext()
             Task { @MainActor [weak self] in
-                guard let self,
-                      self.isCurrentSocketEvent(context) else { return }
+                guard let self else { return }
+                guard self.isCurrentSocketEvent(context) else { return }
                 await self.recoverActiveMeetingFromForeground()
                 if shouldRestoreRemoteVideo {
                     await self.applyRemoteConsumerBandwidthPolicy()
@@ -6736,6 +6758,9 @@ final class MeetingViewModel {
         case .joined, .reconnecting:
             break
         default:
+            foregroundResumePresentationTask?.cancel()
+            foregroundResumePresentationTask = nil
+            state.isResumingFromBackground = false
             return
         }
 
@@ -6745,8 +6770,8 @@ final class MeetingViewModel {
 
         let context = currentSocketEventContext()
         Task { @MainActor [weak self] in
-            guard let self,
-                  self.isCurrentSocketEvent(context) else { return }
+            guard let self else { return }
+            guard self.isCurrentSocketEvent(context) else { return }
             await self.recoverActiveMeetingFromForeground()
             if shouldRestoreRemoteVideo {
                 await self.applyRemoteConsumerBandwidthPolicy()
@@ -6760,6 +6785,21 @@ final class MeetingViewModel {
 
     func handleAppEnteredBackground() {
         persistMeetingResumeSnapshot()
+        foregroundResumePresentationTask?.cancel()
+        foregroundResumePresentationTask = nil
+        switch state.connectionState {
+        case .joined, .reconnecting, .waiting:
+            state.isResumingFromBackground = true
+        default:
+            state.isResumingFromBackground = false
+        }
+        #if os(iOS) && !SKIP
+        if CallSessionCoordinator.shared.isInCall {
+            CallAudioSession.shared.maintainBackgroundCall()
+            webRTCClient.activateCallAudioSession()
+        }
+        ScreenCaptureManager.shared.reconcileBroadcastLifecycle()
+        #endif
         let wasForeground = appForegroundAllowsRemoteVideoReceive
         webcamReceiverCapacityAuthorityGeneration += 1
         appForegroundAllowsRemoteVideoReceive = false
@@ -7105,6 +7145,9 @@ final class MeetingViewModel {
         screenSharePublishConnectionQuality = .unknown
         receiveConnectionQuality = .unknown
         state.isRecoveringConnection = false
+        foregroundResumePresentationTask?.cancel()
+        foregroundResumePresentationTask = nil
+        state.isResumingFromBackground = false
         lastJoinContext = nil
     }
 

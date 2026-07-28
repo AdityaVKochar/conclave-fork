@@ -352,6 +352,8 @@ export interface JoinRoomResponse {
   webinarRequiresInviteCode?: boolean;
   webinarAttendeeCount?: number;
   webinarMaxAttendees?: number;
+  webinarQaEnabled?: boolean;
+  webinarSpeakerUserId?: string | null;
   webcamCodecPolicy?: WebcamCodecPolicy;
 }
 
@@ -371,6 +373,7 @@ export interface WebinarConfigSnapshot {
   requiresInviteCode: boolean;
   linkSlug?: string | null;
   feedMode: "active-speaker";
+  qaEnabled?: boolean;
 }
 
 export interface WebinarUpdateRequest {
@@ -380,6 +383,64 @@ export interface WebinarUpdateRequest {
   maxAttendees?: number;
   inviteCode?: string | null;
   linkSlug?: string | null;
+  qaEnabled?: boolean;
+}
+
+export type WebinarQaStatus = "pending" | "answering" | "answered" | "dismissed";
+
+export interface WebinarQaEntry {
+  id: string;
+  userId: string;
+  displayName: string;
+  question: string;
+  status: WebinarQaStatus;
+  askedAt: number;
+  updatedAt: number;
+  upvotes: number;
+  hasUpvoted?: boolean;
+  answerText?: string;
+  answeredByName?: string;
+}
+
+export interface WebinarQaSnapshot {
+  roomId: string;
+  entries: WebinarQaEntry[];
+}
+
+export interface WebinarQaChangedNotification {
+  roomId: string;
+  entry?: WebinarQaEntry;
+  removedId?: string;
+}
+
+export interface WebinarQaModerateRequest {
+  id: string;
+  action: "answering" | "answered" | "dismissed" | "reopen";
+  answerText?: string;
+}
+
+export interface WebinarHandQueueEntry {
+  userId: string;
+  displayName: string;
+  raisedAt: number;
+}
+
+export interface WebinarHandQueueChangedNotification {
+  roomId: string;
+  queue: WebinarHandQueueEntry[];
+}
+
+export interface WebinarPromotedNotification {
+  roomId: string;
+  /** Room id to rejoin with as a full participant. */
+  rejoinRoomId: string;
+  promotedByName?: string;
+}
+
+export interface WebinarDemotedNotification {
+  roomId: string;
+  /** Public webinar slug to rejoin with as an attendee, when known. */
+  webinarLinkSlug?: string | null;
 }
 
 export interface MeetingConfigSnapshot {

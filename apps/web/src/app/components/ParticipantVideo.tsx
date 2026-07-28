@@ -34,6 +34,8 @@ interface ParticipantVideoProps {
   onAudioPlaybackStarted?: () => void;
   audioPlaybackAttemptToken?: number;
   disableAudio?: boolean;
+  /** Suppress the built-in name pill (a stage that draws its own chrome). */
+  hideLabel?: boolean;
   isPinned?: boolean;
   onTogglePin?: (userId: string) => void;
   isDynamicCropEnabled?: boolean;
@@ -54,6 +56,7 @@ function ParticipantVideo({
   onAudioPlaybackStarted,
   audioPlaybackAttemptToken,
   disableAudio = false,
+  hideLabel = false,
   isPinned = false,
   onTogglePin,
   isDynamicCropEnabled = false,
@@ -345,28 +348,30 @@ function ParticipantVideo({
           <Hand className={compact || dense ? "w-3 h-3" : "w-4 h-4"} />
         </div>
       )}
-      <div
-        className={`absolute bg-black/70 border border-[#fafafa]/10 rounded-full flex items-center ${labelWidthClass} ${labelPillClass}`}
-      >
-        <span
-          className="font-medium text-[#fafafa] truncate"
-          title={displayName}
+      {!hideLabel && (
+        <div
+          className={`absolute bg-black/70 border border-[#fafafa]/10 rounded-full flex items-center ${labelWidthClass} ${labelPillClass}`}
         >
-          {displayLabel}
-        </span>
-        {isActiveSpeaker && !participant.isMuted && (
-          <span className="acm-voice-activity" aria-label="Speaking">
-            <span />
-            <span />
-            <span />
+          <span
+            className="font-medium text-[#fafafa] truncate"
+            title={displayName}
+          >
+            {displayLabel}
           </span>
-        )}
-        {participant.isMuted && (
-          <MicOff
-            className={`text-[#F95F4A] shrink-0 ${dense ? "w-2.5 h-2.5" : "w-3 h-3"}`}
-          />
-        )}
-      </div>
+          {isActiveSpeaker && !participant.isMuted && (
+            <span className="acm-voice-activity" aria-label="Speaking">
+              <span />
+              <span />
+              <span />
+            </span>
+          )}
+          {participant.isMuted && (
+            <MicOff
+              className={`text-[#F95F4A] shrink-0 ${dense ? "w-2.5 h-2.5" : "w-3 h-3"}`}
+            />
+          )}
+        </div>
+      )}
       {onTogglePin && (
         <button
           type="button"

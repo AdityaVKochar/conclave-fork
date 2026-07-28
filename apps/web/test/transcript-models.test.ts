@@ -27,9 +27,9 @@ describe("transcript model registry", () => {
     });
   });
 
-  it("does not prompt gpt-realtime-whisper transcription sessions", () => {
+  it("does not prompt gpt-live-transcribe transcription sessions", () => {
     const realtimeWhisper =
-      getTranscriptTranscriptionModelConfig("gpt-realtime-whisper");
+      getTranscriptTranscriptionModelConfig("gpt-live-transcribe");
     expect(realtimeWhisper.supportsPrompt).toBe(false);
     expect(realtimeWhisper.supportsDelay).toBe(true);
     expect(
@@ -44,10 +44,10 @@ describe("transcript model registry", () => {
 
   it("only exposes live-capable transcription models for room sessions", () => {
     expect(LIVE_TRANSCRIPT_TRANSCRIPTION_MODELS.map((model) => model.id)).toEqual(
-      ["gpt-realtime-whisper", "saaras:v3"],
+      ["gpt-live-transcribe", "saaras:v3"],
     );
     expect(getTranscriptTranscriptionProvider("saaras:v3")).toBe("sarvam");
-    expect(getTranscriptTranscriptionProvider("gpt-realtime-whisper")).toBe(
+    expect(getTranscriptTranscriptionProvider("gpt-live-transcribe")).toBe(
       "openai",
     );
   });

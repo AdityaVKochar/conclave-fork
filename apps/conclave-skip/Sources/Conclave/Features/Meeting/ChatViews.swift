@@ -56,7 +56,11 @@ enum ChatComposerLayout {
     }
 
     static func composerBottomPadding(isAndroid: Bool, contentInset: CGFloat) -> CGFloat {
-        composerVerticalPadding(isAndroid: isAndroid) + max(0.0, contentInset)
+        // contentInset is the total clearance requested by the host (home
+        // indicator or keyboard), not extra spacing to stack below the normal
+        // composer padding. Taking the maximum avoids the dead strip that used
+        // to appear below the input on iPhones with a home indicator.
+        max(composerVerticalPadding(isAndroid: isAndroid), contentInset)
     }
 
     static func suggestionPopoverHeight(itemCount: Int, maxHeight: CGFloat) -> CGFloat {
@@ -196,15 +200,11 @@ struct ChatOverlayView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .acmColorBackground(ACMColors.surface)
-        .overlay(alignment: .leading) {
-            // Left divider so the panel reads as a dock against the stage
-            // (matches the web chat's `border-l`); at the screen edge on phones.
-            Rectangle().fill(ACMColors.border).frame(width: 1)
-        }
-        .overlay(alignment: .top) {
-            // Top hairline: the dock starts mid-screen below the header, and
-            // without a bounded top edge it reads as a clipped rectangle.
-            Rectangle().fill(ACMColors.border).frame(height: 1)
+        .overlay {
+            // Draw the outline inside the panel bounds. A regular stroke puts
+            // half its width outside the trailing screen edge, which made the
+            // right side look clipped while the left divider stayed visible.
+            Rectangle().strokeBorder(ACMColors.border, lineWidth: 1)
         }
         .onDisappear {
             reportFocus(false)
@@ -393,62 +393,51 @@ private struct ChatComposerView: View {
                 )
             }
 
-            HStack(alignment: .bottom, spacing: 10) {
-                Button {
-                    isInputFocused = false
-                    showGifPicker = true
-                } label: {
-                    HStack(spacing: 5) {
-                        ACMSystemIcon.icon("photo.stack", android: "gif", size: 13)
-                        Text("GIF")
-                            .font(ACMFont.trial(11, weight: .semibold))
+            HStack(alignment: .bottom, spacing: 8) {
+                Menu {
+                    Button(action: openGifPicker) {
+                        Label {
+                            Text("Add GIF")
+                        } icon: {
+                            ACMSystemIcon.icon("photo.stack", android: "gif", size: 15)
+                        }
                     }
-                    .foregroundStyle(isChatDisabled ? ACMColors.textFaint : ACMColors.textMuted)
-                    .frame(width: 58, height: inputHeight)
-                    .acmColorBackground(ACMColors.surfaceRaised)
-                    .overlay {
-                        Capsule().strokeBorder(ACMColors.border, lineWidth: 1)
-                    }
-                    .clipShape(Capsule())
-                }
-                .buttonStyle(.plain)
-                .frame(width: 58, height: inputHeight)
-                #if !SKIP
-                .contentShape(Capsule())
-                #endif
-                .disabled(isChatDisabled)
-                .accessibilityLabel("Add a GIF")
 
-                if viewModel.state.isImageAttachmentsEnabled {
-                    Button {
-                        isInputFocused = false
-                        showImagePicker = true
-                    } label: {
-                        Group {
-                            if viewModel.state.isChatImageUploading {
-                                ProgressView()
-                                    .tint(ACMColors.primaryOrange)
-                                    .scaleEffect(0.7)
-                            } else {
-                                ACMSystemIcon.icon("photo", android: "image", size: 14)
-                                    .foregroundStyle(isChatDisabled ? ACMColors.textFaint : ACMColors.textMuted)
+                    if viewModel.state.isImageAttachmentsEnabled {
+                        Button(action: openImagePicker) {
+                            Label {
+                                Text(viewModel.state.isChatImageUploading ? "Uploading photo…" : "Attach photo")
+                            } icon: {
+                                ACMSystemIcon.icon("photo", android: "image", size: 15)
                             }
                         }
-                        .frame(width: inputHeight, height: inputHeight)
-                        .acmColorBackground(ACMColors.surfaceRaised)
-                        .overlay {
-                            Circle().strokeBorder(ACMColors.border, lineWidth: 1)
-                        }
-                        .clipShape(Circle())
+                        .disabled(viewModel.state.isChatImageUploading)
                     }
-                    .buttonStyle(.plain)
+                } label: {
+                    Group {
+                        if viewModel.state.isChatImageUploading {
+                            ProgressView()
+                                .tint(ACMColors.primaryOrange)
+                                .scaleEffect(0.7)
+                        } else {
+                            ACMSystemIcon.icon("plus", android: "add", size: 17)
+                                .foregroundStyle(isChatDisabled ? ACMColors.textFaint : ACMColors.textMuted)
+                        }
+                    }
                     .frame(width: inputHeight, height: inputHeight)
-                    #if !SKIP
-                    .contentShape(Circle())
-                    #endif
-                    .disabled(isChatDisabled || viewModel.state.isChatImageUploading)
-                    .accessibilityLabel("Attach a photo")
+                    .acmColorBackground(ACMColors.surfaceRaised)
+                    .overlay {
+                        Circle().strokeBorder(ACMColors.border, lineWidth: 1)
+                    }
+                    .clipShape(Circle())
                 }
+                .buttonStyle(.plain)
+                .frame(width: inputHeight, height: inputHeight)
+                #if !SKIP
+                .contentShape(Circle())
+                #endif
+                .disabled(isChatDisabled)
+                .accessibilityLabel("Add GIF or photo")
 
                 #if SKIP
                 TextField(placeholder, text: messageTextBinding)
@@ -489,6 +478,7 @@ private struct ChatComposerView: View {
                     .submitLabel(SubmitLabel.send)
                     .onSubmit { sendMessage() }
                     .disabled(isChatDisabled)
+                    .layoutPriority(1)
                 #endif
 
                 Button {
@@ -596,6 +586,18 @@ private struct ChatComposerView: View {
         .onDisappear {
             onFocusChanged(false)
         }
+    }
+
+    private func openGifPicker() {
+        isInputFocused = false
+        showGifPicker = true
+    }
+
+    private func openImagePicker() {
+        guard viewModel.state.isImageAttachmentsEnabled,
+              !viewModel.state.isChatImageUploading else { return }
+        isInputFocused = false
+        showImagePicker = true
     }
 
     private func sendPickedImage(_ url: URL) {
@@ -897,7 +899,18 @@ private struct ChatTimelineView: View, Equatable {
             let isReplyFromCurrentUser = message.replyTo.map { reply in
                 isCurrentUser(reply.userId)
             } == true
-            let grouped = ChatGroupingPolicy.grouped(message: message, previous: previousMessage)
+            // The server and SFU can use different raw ids for the same local
+            // participant. Optimistic sends use the SFU id, while the echo may
+            // use the account/session id; treat both as one canonical sender so
+            // a follow-up message is grouped before its acknowledgement arrives.
+            let sameLocalSender = isFromCurrentUser && previousMessage.map { previous in
+                isCurrentUser(previous.userId)
+            } == true
+            let grouped = ChatGroupingPolicy.grouped(
+                message: message,
+                previous: previousMessage,
+                sameLocalSender: sameLocalSender
+            )
             if let actionText = ChatMessagePresentation.actionText(from: message.content) {
                 ChatActionMessageRow(
                     message: message,
@@ -1539,9 +1552,13 @@ struct ChatActionMessageRow: View {
 enum ChatGroupingPolicy {
     static let groupWindowSeconds: TimeInterval = 300
 
-    static func grouped(message: ChatMessage, previous: ChatMessage?) -> Bool {
+    static func grouped(
+        message: ChatMessage,
+        previous: ChatMessage?,
+        sameLocalSender: Bool = false
+    ) -> Bool {
         guard let previous else { return false }
-        return previous.userId == message.userId
+        return (previous.userId == message.userId || sameLocalSender)
             && previous.isDirect == message.isDirect
             && previous.dmTargetUserId == message.dmTargetUserId
             && message.timestamp.timeIntervalSince(previous.timestamp) < groupWindowSeconds

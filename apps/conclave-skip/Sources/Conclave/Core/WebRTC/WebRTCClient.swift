@@ -386,6 +386,89 @@ private final class FirstDecodedVideoFrameRenderer: NSObject, RTCVideoRenderer {
 
 // MARK: - WebRTC Client (Mediasoup)
 
+private struct ScreenFrameEncoderDelivery: @unchecked Sendable {
+    let frame: RTCVideoFrame
+    let source: RTCVideoSource
+    let capturer: RTCVideoCapturer
+}
+
+/// WebRTC's capturer callback may synchronously wait on its encoder queue.
+/// Calling it on MainActor makes the entire meeting UI stop accepting taps.
+/// This pump runs that callback on a dedicated serial queue and coalesces any
+/// backlog to the newest frame, bounding retained pixel buffers to two.
+private final class ScreenFrameEncoderPump: @unchecked Sendable {
+    private let queue = DispatchQueue(
+        label: "com.acmvit.conclave.screenshare.encoder",
+        qos: .userInitiated
+    )
+    private let lock = NSLock()
+    private var pendingDelivery: ScreenFrameEncoderDelivery?
+    private var deliveryScheduled = false
+
+    func enqueue(_ delivery: ScreenFrameEncoderDelivery) {
+        lock.lock()
+        pendingDelivery = delivery
+        let shouldSchedule = !deliveryScheduled
+        if shouldSchedule {
+            deliveryScheduled = true
+        }
+        lock.unlock()
+
+        if shouldSchedule {
+            scheduleDrain()
+        }
+    }
+
+    func reset() {
+        lock.lock()
+        pendingDelivery = nil
+        lock.unlock()
+    }
+
+    private func scheduleDrain() {
+        queue.async { [weak self] in
+            self?.drain()
+        }
+    }
+
+    private func drain() {
+        lock.lock()
+        guard let delivery = pendingDelivery else {
+            deliveryScheduled = false
+            lock.unlock()
+            return
+        }
+        pendingDelivery = nil
+        lock.unlock()
+
+        delivery.source.capturer(delivery.capturer, didCapture: delivery.frame)
+
+        lock.lock()
+        let shouldContinue = pendingDelivery != nil
+        if !shouldContinue {
+            deliveryScheduled = false
+        }
+        lock.unlock()
+
+        if shouldContinue {
+            scheduleDrain()
+        }
+    }
+}
+
+private struct ScreenProducerCreationRequest: @unchecked Sendable {
+    let transport: SendTransport
+    let track: RTCVideoTrack
+    let encoding: RTCRtpEncodingParameters
+    let scalabilityMode: String
+    let codec: String?
+    let appData: String
+}
+
+private struct ScreenProducerCreationResult: @unchecked Sendable {
+    let producer: Producer
+}
+
 @MainActor
 final class WebRTCClient: NSObject, ObservableObject {
 
@@ -1965,6 +2048,18 @@ final class WebRTCClient: NSObject, ObservableObject {
     var captureSession: AVCaptureSession?
     private var currentVideoQuality: VideoQuality = .standard
     private var currentLocalBandwidthQuality: ConnectionQuality = .unknown
+    private var configuredCameraWidth = 1_280
+    private var configuredCameraHeight = 720
+    private var configuredCameraFrameRate = 30
+    private var configuredCameraMaxBitrateBps = 1_650_000
+    private var configuredCameraContentHint = NativeCameraContentHint.motion.rawValue
+    private var configuredCameraDegradationPreference = NativeMediaDegradationPreference.maintainFramerate.rawValue
+    private var configuredScreenMaxWidth = 3_840
+    private var configuredScreenMaxHeight = 2_160
+    private var configuredScreenFrameRate = 24
+    private var configuredScreenMaxBitrateBps = 2_500_000
+    private var configuredScreenContentHint = NativeScreenShareContentHint.detail.rawValue
+    private var configuredScreenDegradationPreference = NativeMediaDegradationPreference.maintainResolution.rawValue
     private var webcamProducerTopology: WebcamProducerTopology = .other
     private var webcamReceiverCapacityRoomId: String?
     private var webcamReceiverCapacityAuthorityAvailable = false
@@ -1985,8 +2080,14 @@ final class WebRTCClient: NSObject, ObservableObject {
     private var callAudioRouteNotificationTask: Task<Void, Never>?
     private var lastAppliedLocalBandwidthSignature: String?
     private var lastForwardedScreenFrameNs: UInt64 = 0
-    private static let screenShareScalabilityMode = "L1T3"
-    private static let screenShareTemporalLayerCount = 3
+    private let screenFrameEncoderPump = ScreenFrameEncoderPump()
+    private var screenShareTemporalLayerCount: Int {
+        configuredScreenContentHint == NativeScreenShareContentHint.motion.rawValue ? 3 : 2
+    }
+
+    private var screenShareScalabilityMode: String {
+        "L1T\(screenShareTemporalLayerCount)"
+    }
 
     private struct WebcamCaptureProfile {
         let width: Int32
@@ -2426,6 +2527,9 @@ final class WebRTCClient: NSObject, ObservableObject {
             )
             localVideoTrack = trackWrapper
 
+            // The producer already starts with the resolved bandwidth parameters.
+            // Reapplying them while the native sender is still being created can crash
+            // physical iOS devices inside WebRTC's sender parameter update path.
             debugLog("[WebRTC] Video producer created: \(producer.id)")
         } catch {
             pendingProducer?.close()
@@ -2460,38 +2564,73 @@ final class WebRTCClient: NSObject, ObservableObject {
         for quality: VideoQuality,
         connectionQuality: ConnectionQuality = .unknown
     ) -> WebcamCaptureProfile {
+        let configured = WebcamCaptureProfile(
+            width: Int32(configuredCameraWidth),
+            height: Int32(configuredCameraHeight),
+            fps: Float64(configuredCameraFrameRate)
+        )
         if connectionQuality == .emergency {
-            return WebcamCaptureProfile(width: 640, height: 360, fps: 8)
+            return constrainedWebcamCaptureProfile(configured, maxWidth: 640, maxHeight: 360, maxFPS: 8)
         }
         if connectionQuality == .poor {
-            return WebcamCaptureProfile(width: 640, height: 360, fps: 12)
+            return constrainedWebcamCaptureProfile(configured, maxWidth: 640, maxHeight: 360, maxFPS: 12)
         }
-        if connectionQuality == .fair || quality == .low {
-            return WebcamCaptureProfile(width: 640, height: 360, fps: 20)
+        if connectionQuality == .fair {
+            return constrainedWebcamCaptureProfile(configured, maxWidth: 640, maxHeight: 360, maxFPS: 20)
         }
+        return configured
+    }
 
-        switch quality {
-        case .low:
-            return WebcamCaptureProfile(width: 640, height: 360, fps: 20)
-        case .standard:
-            return WebcamCaptureProfile(width: 1280, height: 720, fps: 30)
-        }
+    private func constrainedWebcamCaptureProfile(
+        _ configured: WebcamCaptureProfile,
+        maxWidth: Int32,
+        maxHeight: Int32,
+        maxFPS: Float64
+    ) -> WebcamCaptureProfile {
+        WebcamCaptureProfile(
+            width: min(configured.width, maxWidth),
+            height: min(configured.height, maxHeight),
+            fps: min(configured.fps, maxFPS)
+        )
     }
 
     private func webcamEncodingSpecs(for quality: VideoQuality) -> [WebcamEncodingSpec] {
+        let defaults: [WebcamEncodingSpec]
+        let defaultMaximumBitrate: Int
         switch quality {
         case .low:
-            return [
+            defaults = [
                 WebcamEncodingSpec(rid: "q", scaleResolutionDownBy: 2, maxBitrateBps: 65_000, maxFramerate: 8),
                 WebcamEncodingSpec(rid: "h", scaleResolutionDownBy: 1, maxBitrateBps: 120_000, maxFramerate: 12),
                 WebcamEncodingSpec(rid: "f", scaleResolutionDownBy: 1, maxBitrateBps: 180_000, maxFramerate: 15)
             ]
+            defaultMaximumBitrate = 180_000
         case .standard:
-            return [
+            defaults = [
                 WebcamEncodingSpec(rid: "q", scaleResolutionDownBy: 4, maxBitrateBps: 80_000, maxFramerate: 12),
                 WebcamEncodingSpec(rid: "h", scaleResolutionDownBy: 2, maxBitrateBps: 220_000, maxFramerate: 20),
                 WebcamEncodingSpec(rid: "f", scaleResolutionDownBy: 1, maxBitrateBps: 1_650_000, maxFramerate: 30)
             ]
+            defaultMaximumBitrate = 1_650_000
+        }
+
+        let lastIndex = defaults.count - 1
+        return defaults.enumerated().map { index, spec in
+            let bitrateRatio = Double(spec.maxBitrateBps) / Double(defaultMaximumBitrate)
+            let detailLayerFactor = configuredCameraContentHint == NativeCameraContentHint.detail.rawValue && index < lastIndex
+                ? 0.75
+                : 1.0
+            return WebcamEncodingSpec(
+                rid: spec.rid,
+                scaleResolutionDownBy: spec.scaleResolutionDownBy,
+                maxBitrateBps: max(
+                    20_000,
+                    Int((Double(configuredCameraMaxBitrateBps) * bitrateRatio * detailLayerFactor).rounded())
+                ),
+                maxFramerate: index == lastIndex
+                    ? Double(configuredCameraFrameRate)
+                    : min(spec.maxFramerate, Double(configuredCameraFrameRate))
+            )
         }
     }
 
@@ -2578,8 +2717,8 @@ final class WebRTCClient: NSObject, ObservableObject {
         let encoding = RTCRtpEncodingParameters()
         encoding.isActive = true
         encoding.scaleResolutionDownBy = NSNumber(value: 1.0)
-        encoding.maxBitrateBps = NSNumber(value: 1_650_000)
-        encoding.maxFramerate = NSNumber(value: 30.0)
+        encoding.maxBitrateBps = NSNumber(value: configuredCameraMaxBitrateBps)
+        encoding.maxFramerate = NSNumber(value: Double(configuredCameraFrameRate))
         encoding.numTemporalLayers = NSNumber(value: WebcamTemporalLayerPolicy.temporalLayerCount)
         encoding.networkPriority = .low
         return [encoding]
@@ -2588,7 +2727,7 @@ final class WebRTCClient: NSObject, ObservableObject {
     /// The compensating topology is always the known-good standard VP8 ladder.
     /// Adaptive sender updates may constrain it later without changing topology.
     private func restoredAdaptiveWebcamEncodings() -> [RTCRtpEncodingParameters] {
-        webcamEncodings(for: .standard, connectionQuality: .good)
+        webcamEncodings(for: currentVideoQuality, connectionQuality: .good)
     }
 
     private func webcamMaxSpatialLayer(
@@ -2629,20 +2768,69 @@ final class WebRTCClient: NSObject, ObservableObject {
     private func screenShareEncodingCap(
         connectionQuality: ConnectionQuality
     ) -> ScreenShareEncodingCap {
+        let configuredBitrate = configuredScreenMaxBitrateBps
+        let configuredFramerate = Double(configuredScreenFrameRate)
         switch connectionQuality {
         case .emergency:
-            return ScreenShareEncodingCap(maxBitrateBps: 220_000, maxFramerate: 3)
+            return ScreenShareEncodingCap(
+                maxBitrateBps: min(configuredBitrate, 220_000),
+                maxFramerate: min(configuredFramerate, 3)
+            )
         case .poor:
-            return ScreenShareEncodingCap(maxBitrateBps: 450_000, maxFramerate: 5)
+            return ScreenShareEncodingCap(
+                maxBitrateBps: min(configuredBitrate, 450_000),
+                maxFramerate: min(configuredFramerate, 5)
+            )
         case .fair:
-            return ScreenShareEncodingCap(maxBitrateBps: 1_200_000, maxFramerate: 12)
+            return ScreenShareEncodingCap(
+                maxBitrateBps: min(configuredBitrate, 1_200_000),
+                maxFramerate: min(configuredFramerate, 12)
+            )
         case .good, .unknown:
-            return ScreenShareEncodingCap(maxBitrateBps: 2_500_000, maxFramerate: 24)
+            return ScreenShareEncodingCap(
+                maxBitrateBps: configuredBitrate,
+                maxFramerate: configuredFramerate
+            )
         }
+    }
+
+    private func screenShareResolutionCap(
+        connectionQuality: ConnectionQuality
+    ) -> (width: Int, height: Int) {
+        switch connectionQuality {
+        case .emergency:
+            return (min(configuredScreenMaxWidth, 1_280), min(configuredScreenMaxHeight, 720))
+        case .poor:
+            return (min(configuredScreenMaxWidth, 1_920), min(configuredScreenMaxHeight, 1_080))
+        case .fair:
+            return (min(configuredScreenMaxWidth, 2_560), min(configuredScreenMaxHeight, 1_440))
+        case .good, .unknown:
+            return (configuredScreenMaxWidth, configuredScreenMaxHeight)
+        }
+    }
+
+    private func updateScreenCaptureProfile(connectionQuality: ConnectionQuality) {
+        let cap = screenShareEncodingCap(connectionQuality: connectionQuality)
+        let resolution = screenShareResolutionCap(connectionQuality: connectionQuality)
+        ScreenCaptureManager.shared.updatePublishProfile(
+            maxFrameRate: cap.maxFramerate,
+            maxWidth: resolution.width,
+            maxHeight: resolution.height,
+            maxBitrateBps: cap.maxBitrateBps,
+            contentHint: configuredScreenContentHint
+        )
     }
 
     var screenShareCaptureMaxFramerate: Double {
         screenShareEncodingCap(connectionQuality: currentLocalBandwidthQuality).maxFramerate
+    }
+
+    var screenShareCaptureMaxWidth: Int {
+        screenShareResolutionCap(connectionQuality: currentLocalBandwidthQuality).width
+    }
+
+    var screenShareCaptureMaxHeight: Int {
+        screenShareResolutionCap(connectionQuality: currentLocalBandwidthQuality).height
     }
 
     private func screenShareEncoding(
@@ -2653,7 +2841,7 @@ final class WebRTCClient: NSObject, ObservableObject {
         encoding.isActive = true
         encoding.maxBitrateBps = NSNumber(value: cap.maxBitrateBps)
         encoding.maxFramerate = NSNumber(value: cap.maxFramerate)
-        encoding.numTemporalLayers = NSNumber(value: Self.screenShareTemporalLayerCount)
+        encoding.numTemporalLayers = NSNumber(value: screenShareTemporalLayerCount)
         encoding.networkPriority = .high
         return encoding
     }
@@ -2663,6 +2851,42 @@ final class WebRTCClient: NSObject, ObservableObject {
     ) -> [RTCRtpEncodingParameters] {
         let encoding = screenShareEncoding(connectionQuality: connectionQuality)
         return [encoding]
+    }
+
+    /// mediasoup's Swift wrapper synchronously waits for its `onProduce`
+    /// callback. That callback performs async socket signaling on MainActor, so
+    /// invoking `createProducer` on MainActor deadlocks until iOS's scene-update
+    /// watchdog kills the app. Run the blocking wrapper call off-main; awaiting
+    /// it keeps this actor re-entrant so `onProduce` can complete normally.
+    private func createScreenProducerOffMain(
+        on transport: SendTransport,
+        track: RTCVideoTrack,
+        encoding: RTCRtpEncodingParameters,
+        scalabilityMode: String,
+        codec: String?,
+        appData: String
+    ) async throws -> Producer {
+        let request = ScreenProducerCreationRequest(
+            transport: transport,
+            track: track,
+            encoding: encoding,
+            scalabilityMode: scalabilityMode,
+            codec: codec,
+            appData: appData
+        )
+        let result = try await Task.detached(priority: .userInitiated) {
+            ScreenProducerCreationResult(
+                producer: try request.transport.createProducer(
+                    for: request.track,
+                    encoding: request.encoding,
+                    scalabilityMode: request.scalabilityMode,
+                    codecOptions: nil,
+                    codec: request.codec,
+                    appData: request.appData
+                )
+            )
+        }.value
+        return try requireRegisteredProducer(result.producer, label: "screen")
     }
 
     func getCameraDevice(position: AVCaptureDevice.Position) -> AVCaptureDevice? {
@@ -3921,6 +4145,57 @@ final class WebRTCClient: NSObject, ObservableObject {
         return !definitiveRejections.contains { message.contains($0) }
     }
 
+    private func degradationPreference(
+        for rawValue: String,
+        fallback: RTPParameters.DegradationPreference
+    ) -> RTPParameters.DegradationPreference {
+        switch rawValue {
+        case NativeMediaDegradationPreference.balanced.rawValue:
+            return .balanced
+        case NativeMediaDegradationPreference.maintainResolution.rawValue:
+            return .maintainResolution
+        case NativeMediaDegradationPreference.maintainFramerate.rawValue:
+            return .maintainFramerate
+        default:
+            return fallback
+        }
+    }
+
+    func updateMediaPublishConfiguration(
+        cameraWidth: Int,
+        cameraHeight: Int,
+        cameraFrameRate: Int,
+        cameraMaxBitrateBps: Int,
+        cameraContentHint: String,
+        cameraDegradationPreference: String,
+        screenMaxWidth: Int,
+        screenMaxHeight: Int,
+        screenFrameRate: Int,
+        screenMaxBitrateBps: Int,
+        screenContentHint: String,
+        screenDegradationPreference: String
+    ) {
+        configuredCameraWidth = min(3_840, max(160, cameraWidth))
+        configuredCameraHeight = min(2_160, max(90, cameraHeight))
+        configuredCameraFrameRate = min(60, max(5, cameraFrameRate))
+        configuredCameraMaxBitrateBps = min(12_000_000, max(100_000, cameraMaxBitrateBps))
+        configuredCameraContentHint = cameraContentHint
+        configuredCameraDegradationPreference = cameraDegradationPreference
+        configuredScreenMaxWidth = min(3_840, max(320, screenMaxWidth))
+        configuredScreenMaxHeight = min(2_160, max(180, screenMaxHeight))
+        configuredScreenFrameRate = min(60, max(1, screenFrameRate))
+        configuredScreenMaxBitrateBps = min(15_000_000, max(150_000, screenMaxBitrateBps))
+        configuredScreenContentHint = screenContentHint
+        configuredScreenDegradationPreference = screenDegradationPreference
+        lastAppliedLocalBandwidthSignature = nil
+        applyLocalBandwidthProfile(connectionQuality: currentLocalBandwidthQuality)
+    }
+
+    func refreshLocalMediaForQualitySettings() async {
+        // iOS updates live sender parameters and capture constraints in
+        // updateMediaPublishConfiguration, so no producer replacement is needed.
+    }
+
     func updateVideoQuality(_ quality: VideoQuality) {
         currentVideoQuality = quality
         evaluateWebcamTopologyTransition()
@@ -3929,7 +4204,18 @@ final class WebRTCClient: NSObject, ObservableObject {
     }
 
     func applyLocalBandwidthProfile(connectionQuality: ConnectionQuality) {
-        let signature = "\(currentVideoQuality.rawValue):\(connectionQuality.rawValue)"
+        let signature = [
+            currentVideoQuality.rawValue,
+            connectionQuality.rawValue,
+            "\(configuredCameraWidth)x\(configuredCameraHeight)@\(configuredCameraFrameRate)",
+            "\(configuredCameraMaxBitrateBps)",
+            configuredCameraContentHint,
+            configuredCameraDegradationPreference,
+            "\(configuredScreenMaxWidth)x\(configuredScreenMaxHeight)@\(configuredScreenFrameRate)",
+            "\(configuredScreenMaxBitrateBps)",
+            configuredScreenContentHint,
+            configuredScreenDegradationPreference
+        ].joined(separator: ":")
         guard lastAppliedLocalBandwidthSignature != signature else { return }
         currentLocalBandwidthQuality = connectionQuality
         lastAppliedLocalBandwidthSignature = signature
@@ -3965,7 +4251,10 @@ final class WebRTCClient: NSObject, ObservableObject {
             )
             producer.updateSenderParameters { parameters in
                 var next = parameters
-                next.degradationPreference = .maintainFramerate
+                next.degradationPreference = self.degradationPreference(
+                    for: self.configuredCameraDegradationPreference,
+                    fallback: .maintainFramerate
+                )
                 if var encodings = next.encodings, !encodings.isEmpty {
                     for index in encodings.indices {
                         let spec = specs[min(index, specs.count - 1)]
@@ -3991,11 +4280,14 @@ final class WebRTCClient: NSObject, ObservableObject {
 
         if let screenProducer, !screenProducer.closed {
             let cap = screenShareEncodingCap(connectionQuality: connectionQuality)
-            ScreenCaptureManager.shared.updateMaxFrameRate(cap.maxFramerate)
+            updateScreenCaptureProfile(connectionQuality: connectionQuality)
             resetScreenFrameLimiter()
             screenProducer.updateSenderParameters { parameters in
                 var next = parameters
-                next.degradationPreference = .maintainResolution
+                next.degradationPreference = self.degradationPreference(
+                    for: self.configuredScreenDegradationPreference,
+                    fallback: .maintainResolution
+                )
                 if var encodings = next.encodings, !encodings.isEmpty {
                     for index in encodings.indices {
                         encodings[index].isActive = true
@@ -4089,24 +4381,19 @@ final class WebRTCClient: NSObject, ObservableObject {
 
         do {
             let appData = try encodeJSONString(ProducerAppData(type: ProducerType.screen.rawValue, paused: false))
-            let producer = try requireRegisteredProducer(
-                sendTransport.createProducer(
-                    for: screenTrack,
-                    encoding: screenShareEncoding(connectionQuality: connectionQuality),
-                    scalabilityMode: Self.screenShareScalabilityMode,
-                    codecOptions: nil,
-                    codec: preferredVideoCodecJSON(),
-                    appData: appData
-                ),
-                label: "screen"
+            let producer = try await createScreenProducerOffMain(
+                on: sendTransport,
+                track: screenTrack,
+                encoding: screenShareEncoding(connectionQuality: connectionQuality),
+                scalabilityMode: screenShareScalabilityMode,
+                codec: preferredVideoCodecJSON(),
+                appData: appData
             )
             producer.delegate = self
             producer.resume()
             screenProducer = producer
             screenProducerBandwidthQuality = connectionQuality
-            ScreenCaptureManager.shared.updateMaxFrameRate(
-                screenShareEncodingCap(connectionQuality: connectionQuality).maxFramerate
-            )
+            updateScreenCaptureProfile(connectionQuality: connectionQuality)
             resetScreenFrameLimiter()
 
             do {
@@ -5594,7 +5881,7 @@ extension WebRTCClient {
         
         let screenSource = Self.factory.videoSource()
         resetScreenFrameLimiter()
-        ScreenCaptureManager.shared.updateMaxFrameRate(screenShareCaptureMaxFramerate)
+        updateScreenCaptureProfile(connectionQuality: currentLocalBandwidthQuality)
         self.screenVideoSource = screenSource
         self.screenVideoCapturer = RTCVideoCapturer(delegate: screenSource)
         
@@ -5604,18 +5891,15 @@ extension WebRTCClient {
 
         do {
             let appData = try encodeJSONString(ProducerAppData(type: ProducerType.screen.rawValue, paused: false))
-            let producer = try requireRegisteredProducer(
-                sendTransport.createProducer(
-                    for: screenTrack,
-                    encoding: screenShareEncoding(
-                        connectionQuality: currentLocalBandwidthQuality
-                    ),
-                    scalabilityMode: Self.screenShareScalabilityMode,
-                    codecOptions: nil,
-                    codec: preferredVideoCodecJSON(),
-                    appData: appData
+            let producer = try await createScreenProducerOffMain(
+                on: sendTransport,
+                track: screenTrack,
+                encoding: screenShareEncoding(
+                    connectionQuality: currentLocalBandwidthQuality
                 ),
-                label: "screen"
+                scalabilityMode: screenShareScalabilityMode,
+                codec: preferredVideoCodecJSON(),
+                appData: appData
             )
             producer.delegate = self
             producer.resume()
@@ -5623,7 +5907,7 @@ extension WebRTCClient {
             screenProducer = producer
             screenProducerBandwidthQuality = currentLocalBandwidthQuality
             evaluateWebcamTopologyTransition()
-
+            // As above, defer any later bandwidth changes until after creation.
             debugLog("[WebRTC] Screen sharing producer created: \(producer.id)")
         } catch {
             screenTrack.isEnabled = false
@@ -5656,7 +5940,13 @@ extension WebRTCClient {
         guard let source = screenVideoSource,
               let capturer = screenVideoCapturer else { return }
         guard shouldForwardScreenFrame() else { return }
-        source.capturer(capturer, didCapture: frame)
+        screenFrameEncoderPump.enqueue(
+            ScreenFrameEncoderDelivery(
+                frame: frame,
+                source: source,
+                capturer: capturer
+            )
+        )
     }
 
     private func shouldForwardScreenFrame(
@@ -5674,6 +5964,7 @@ extension WebRTCClient {
 
     private func resetScreenFrameLimiter() {
         lastForwardedScreenFrameNs = 0
+        screenFrameEncoderPump.reset()
     }
     
     private var screenVideoSource: RTCVideoSource? {

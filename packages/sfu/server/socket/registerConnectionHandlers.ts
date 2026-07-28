@@ -17,6 +17,7 @@ import { registerTranscriptHandlers } from "./handlers/transcriptHandlers.js";
 import { registerAppsHandlers } from "./handlers/appsHandlers.js";
 import { registerGameHandlers } from "./handlers/gameHandlers.js";
 import { registerWebinarHandlers } from "./handlers/webinarHandlers.js";
+import { registerWebinarInteractionHandlers } from "./handlers/webinarInteractionHandlers.js";
 
 export const registerConnectionHandlers = (
   io: SocketIOServer,
@@ -40,6 +41,7 @@ export const registerConnectionHandlers = (
     registerGameHandlers(context);
     registerMeetingHandlers(context);
     registerWebinarHandlers(context);
+    registerWebinarInteractionHandlers(context);
     registerSharedBrowserHandlers(context);
     registerTranscriptHandlers(context);
     registerDisconnectHandlers(context);

@@ -2,7 +2,9 @@
 
 import {
   ChevronDown,
+  ChevronUp,
   Hand,
+  MessageCircleQuestion,
   Mic,
   MicOff,
   MonitorUp,
@@ -12,10 +14,15 @@ import {
   VideoOff,
   X,
 } from "lucide-react";
-import { memo, useEffect, useState } from "react";
+import { memo, useEffect, useMemo, useState } from "react";
 import type { Socket } from "socket.io-client";
 import { Avatar } from "@conclave/ui-tokens/web";
-import type { Participant } from "../lib/types";
+import type {
+  Participant,
+  WebinarHandQueueEntry,
+  WebinarQaEntry,
+  WebinarQaModerateRequest,
+} from "../lib/types";
 import { formatDisplayName, isSystemUserId } from "../lib/utils";
 
 interface ParticipantsPanelProps {
@@ -33,6 +40,19 @@ interface ParticipantsPanelProps {
   };
   hostUserId?: string | null;
   hostUserIds?: string[];
+  webinarEnabled?: boolean;
+  webinarAttendeeCount?: number;
+  webinarQaEntries?: WebinarQaEntry[];
+  webinarHandQueue?: WebinarHandQueueEntry[];
+  onModerateWebinarQuestion?: (
+    request: WebinarQaModerateRequest,
+  ) => Promise<{ ok: boolean; error?: string }>;
+  onPromoteWebinarAttendee?: (
+    userId: string,
+  ) => Promise<{ ok: boolean; error?: string }>;
+  onDemoteWebinarParticipant?: (
+    userId: string,
+  ) => Promise<{ ok: boolean; error?: string }>;
 }
 
 const ICON = 18;
@@ -65,6 +85,13 @@ function ParticipantsPanel({
   localState,
   hostUserId,
   hostUserIds,
+  webinarEnabled = false,
+  webinarAttendeeCount = 0,
+  webinarQaEntries = [],
+  webinarHandQueue = [],
+  onModerateWebinarQuestion,
+  onPromoteWebinarAttendee,
+  onDemoteWebinarParticipant,
 }: ParticipantsPanelProps & {
   socket: Socket | null;
   isAdmin?: boolean | null;
@@ -108,6 +135,42 @@ function ParticipantsPanel({
   const [removingUserId, setRemovingUserId] = useState<string | null>(null);
   const [isAdmittingAll, setIsAdmittingAll] = useState(false);
   const [hostActionError, setHostActionError] = useState<string | null>(null);
+  const [isQaSectionExpanded, setIsQaSectionExpanded] = useState(true);
+  const [isAttendeeSectionExpanded, setIsAttendeeSectionExpanded] =
+    useState(true);
+  const [busyWebinarActionKey, setBusyWebinarActionKey] = useState<
+    string | null
+  >(null);
+  const [demotingUserId, setDemotingUserId] = useState<string | null>(null);
+
+  const openWebinarQuestions = useMemo(() => {
+    if (!webinarEnabled) return [];
+    return webinarQaEntries
+      .filter((entry) => entry.status !== "dismissed")
+      .sort((a, b) => {
+        const rank = (entry: WebinarQaEntry) =>
+          entry.status === "answering" ? 0 : entry.status === "pending" ? 1 : 2;
+        return (
+          rank(a) - rank(b) || b.upvotes - a.upvotes || a.askedAt - b.askedAt
+        );
+      });
+  }, [webinarEnabled, webinarQaEntries]);
+
+  const runWebinarAction = async (
+    key: string,
+    action: () => Promise<{ ok: boolean; error?: string }>,
+  ) => {
+    setBusyWebinarActionKey(key);
+    setHostActionError(null);
+    try {
+      const result = await action();
+      if (!result.ok) {
+        setHostActionError(result.error ?? "Webinar action failed");
+      }
+    } finally {
+      setBusyWebinarActionKey(null);
+    }
+  };
   const effectiveHostUserId = hostUserId ?? (isAdmin ? currentUserId : null);
   const effectiveHostUserIds = new Set<string>(
     hostUserIds && hostUserIds.length > 0
@@ -411,6 +474,212 @@ function ParticipantsPanel({
         </section>
       )}
 
+      {isAdmin && webinarEnabled && (
+        <section className="border-b border-white/10">
+          <button
+            type="button"
+            onClick={() => setIsAttendeeSectionExpanded((prev) => !prev)}
+            className="flex w-full items-center justify-between px-4 py-2.5 transition-colors hover:bg-white/[0.04]"
+            aria-expanded={isAttendeeSectionExpanded}
+          >
+            <span className="flex items-center gap-2 text-[11px] font-semibold uppercase tracking-[0.08em] text-[#71717a]">
+              <Users size={13} strokeWidth={STROKE} />
+              Attendees
+              <span className="rounded-md bg-white/[0.06] px-1.5 py-0.5 text-[11px] font-medium normal-case tracking-normal text-[#a1a1aa]">
+                {webinarAttendeeCount}
+              </span>
+              {webinarHandQueue.length > 0 && (
+                <span className="inline-flex items-center gap-1 rounded-md bg-[#fbbf24]/12 px-1.5 py-0.5 text-[11px] font-medium normal-case tracking-normal text-[#fbbf24]">
+                  <Hand size={11} strokeWidth={STROKE} />
+                  {webinarHandQueue.length}
+                </span>
+              )}
+            </span>
+            <ChevronDown
+              size={ICON}
+              strokeWidth={STROKE}
+              className={`text-[#71717a] transition-transform ${isAttendeeSectionExpanded ? "rotate-180" : ""}`}
+              aria-hidden="true"
+            />
+          </button>
+          {isAttendeeSectionExpanded && (
+            <div className="px-4 pb-3">
+              {webinarHandQueue.length === 0 ? (
+                <p className="text-[12px] leading-snug text-[#71717a]">
+                  {webinarAttendeeCount > 0
+                    ? "Attendees watch quietly. Raised hands show up here."
+                    : "No one is watching yet. Share the webinar link to invite viewers."}
+                </p>
+              ) : (
+                <div className="max-h-44 space-y-1 overflow-y-auto">
+                  {webinarHandQueue.map((entry) => (
+                    <div
+                      key={entry.userId}
+                      className="flex items-center gap-2.5 rounded-lg px-2 py-2"
+                    >
+                      <Hand
+                        size={14}
+                        strokeWidth={STROKE}
+                        className="shrink-0 text-[#fbbf24]"
+                      />
+                      <span
+                        className="min-w-0 flex-1 truncate text-[13px] font-medium text-[#fafafa]"
+                        title={entry.displayName}
+                      >
+                        {formatDisplayName(entry.displayName)}
+                      </span>
+                      {onPromoteWebinarAttendee && (
+                        <button
+                          type="button"
+                          onClick={() =>
+                            void runWebinarAction(
+                              `promote-${entry.userId}`,
+                              () => onPromoteWebinarAttendee(entry.userId),
+                            )
+                          }
+                          disabled={busyWebinarActionKey === `promote-${entry.userId}`}
+                          className={hostActionClass}
+                        >
+                          {busyWebinarActionKey === `promote-${entry.userId}`
+                            ? "Inviting…"
+                            : "Bring on stage"}
+                        </button>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+        </section>
+      )}
+
+      {isAdmin && webinarEnabled && (
+        <section className="border-b border-white/10">
+          <button
+            type="button"
+            onClick={() => setIsQaSectionExpanded((prev) => !prev)}
+            className="flex w-full items-center justify-between px-4 py-2.5 transition-colors hover:bg-white/[0.04]"
+            aria-expanded={isQaSectionExpanded}
+          >
+            <span className="flex items-center gap-2 text-[11px] font-semibold uppercase tracking-[0.08em] text-[#71717a]">
+              <MessageCircleQuestion size={13} strokeWidth={STROKE} />
+              Questions
+              {openWebinarQuestions.length > 0 && (
+                <span className="rounded-md bg-[#F95F4A]/12 px-1.5 py-0.5 text-[11px] font-medium normal-case tracking-normal text-[#F95F4A]">
+                  {openWebinarQuestions.length}
+                </span>
+              )}
+            </span>
+            <ChevronDown
+              size={ICON}
+              strokeWidth={STROKE}
+              className={`text-[#71717a] transition-transform ${isQaSectionExpanded ? "rotate-180" : ""}`}
+              aria-hidden="true"
+            />
+          </button>
+          {isQaSectionExpanded && (
+            <div className="px-4 pb-3">
+              {openWebinarQuestions.length === 0 ? (
+                <p className="text-[12px] leading-snug text-[#71717a]">
+                  Attendee questions land here for you to answer live or
+                  dismiss.
+                </p>
+              ) : (
+                <div className="max-h-56 space-y-1.5 overflow-y-auto">
+                  {openWebinarQuestions.map((entry) => {
+                    const isAnswering = entry.status === "answering";
+                    const isAnswered = entry.status === "answered";
+                    return (
+                      <div
+                        key={entry.id}
+                        className={`rounded-lg border px-2.5 py-2 ${
+                          isAnswering
+                            ? "border-[#F95F4A]/40 bg-[#F95F4A]/[0.06]"
+                            : "border-white/10 bg-black/20"
+                        }`}
+                      >
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="truncate text-[11.5px] font-medium text-[#a1a1aa]">
+                            {formatDisplayName(entry.displayName)}
+                          </span>
+                          <span className="inline-flex shrink-0 items-center gap-1 text-[11px] tabular-nums text-[#71717a]">
+                            <ChevronUp size={12} strokeWidth={STROKE} />
+                            {entry.upvotes}
+                          </span>
+                        </div>
+                        <p className="mt-1 text-[13px] leading-snug text-[#fafafa]">
+                          {entry.question}
+                        </p>
+                        {onModerateWebinarQuestion && (
+                          <div className="mt-2 flex flex-wrap gap-1.5">
+                            {!isAnswering && !isAnswered && (
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  void runWebinarAction(
+                                    `qa-${entry.id}`,
+                                    () =>
+                                      onModerateWebinarQuestion({
+                                        id: entry.id,
+                                        action: "answering",
+                                      }),
+                                  )
+                                }
+                                disabled={busyWebinarActionKey === `qa-${entry.id}`}
+                                className={hostActionClass}
+                              >
+                                Answer live
+                              </button>
+                            )}
+                            {!isAnswered && (
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  void runWebinarAction(
+                                    `qa-${entry.id}`,
+                                    () =>
+                                      onModerateWebinarQuestion({
+                                        id: entry.id,
+                                        action: "answered",
+                                      }),
+                                  )
+                                }
+                                disabled={busyWebinarActionKey === `qa-${entry.id}`}
+                                className={neutralActionClass}
+                              >
+                                {isAnswering ? "Done" : "Mark answered"}
+                              </button>
+                            )}
+                            <button
+                              type="button"
+                              onClick={() =>
+                                void runWebinarAction(
+                                  `qa-${entry.id}`,
+                                  () =>
+                                    onModerateWebinarQuestion({
+                                      id: entry.id,
+                                      action: "dismissed",
+                                    }),
+                                )
+                              }
+                              disabled={busyWebinarActionKey === `qa-${entry.id}`}
+                              className={neutralActionClass}
+                            >
+                              Dismiss
+                            </button>
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          )}
+        </section>
+      )}
+
       {/* Participant list */}
       <div className="min-h-0 flex-1 space-y-0.5 overflow-y-auto px-2 py-2">
         {displayParticipants.map((participant) => {
@@ -626,6 +895,30 @@ function ParticipantsPanel({
                           )}
                         </>
                       )}
+                      {webinarEnabled &&
+                        !isHost &&
+                        onDemoteWebinarParticipant && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setDemotingUserId(participant.userId);
+                              void runWebinarAction(
+                                `demote-${participant.userId}`,
+                                () =>
+                                  onDemoteWebinarParticipant(
+                                    participant.userId,
+                                  ),
+                              ).finally(() => setDemotingUserId(null));
+                            }}
+                            disabled={demotingUserId === participant.userId}
+                            className={neutralActionClass}
+                            title="Move this speaker back to the audience"
+                          >
+                            {demotingUserId === participant.userId
+                              ? "Moving…"
+                              : "Move to audience"}
+                          </button>
+                        )}
                       {participant.audioProducerId ? (() => {
                         const producerId = participant.audioProducerId;
                         return (

@@ -42,8 +42,8 @@ export interface TranscriptResponseModelConfig {
 
 export const TRANSCRIPT_TRANSCRIPTION_MODELS = [
   {
-    id: "gpt-realtime-whisper",
-    label: "Realtime Whisper",
+    id: "gpt-live-transcribe",
+    label: "GPT Live Transcribe",
     provider: "openai",
     description:
       "Best live transcription latency and word error rate for Realtime audio.",

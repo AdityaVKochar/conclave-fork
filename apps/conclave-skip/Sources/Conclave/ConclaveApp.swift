@@ -12,27 +12,12 @@ let logger: Logger = Logger(subsystem: "com.acmvit.conclave", category: "Conclav
 
 public struct ConclaveRootView: View {
     @State private var appState = AppState.shared
-    #if !SKIP
-    @Environment(\.scenePhase) private var scenePhase
-    #endif
 
     public init() {
     }
 
     public var body: some View {
         ContentView(appState: appState)
-            #if !SKIP
-            .onChange(of: scenePhase) { _, phase in
-                switch phase {
-                case .active:
-                    ConclaveAppDelegate.shared.onResume()
-                case .background:
-                    ConclaveAppDelegate.shared.onStop()
-                default:
-                    break
-                }
-            }
-            #endif
             #if !SKIP
             .onOpenURL { url in
                 _ = ConclaveAppDelegate.shared.onOpenURL(url)
@@ -45,26 +30,44 @@ public struct ConclaveRootView: View {
     }
 }
 
+enum ConclaveAppLifecyclePhase: Equatable {
+    case launching
+    case active
+    case inactive
+    case background
+}
+
+enum ConclaveAppLifecyclePolicy {
+    static func shouldDeliver(
+        previous: ConclaveAppLifecyclePhase,
+        next: ConclaveAppLifecyclePhase
+    ) -> Bool {
+        previous != next
+    }
+}
+
 public final class ConclaveAppDelegate: Sendable {
     public static let shared = ConclaveAppDelegate()
     @MainActor private var lastOpenURLString: String?
     @MainActor private var lastOpenURLAt = Date.distantPast
+    @MainActor private var lifecyclePhase = ConclaveAppLifecyclePhase.launching
 
     init() {
     }
 
     public func onInit() {
+        #if !SKIP
+        FontRegistration.registerFonts()
+        #endif
         PerformanceDiagnostics.install()
     }
 
     public func onLaunch() {
-        #if !SKIP
-        FontRegistration.registerFonts()
-        #endif
     }
 
     public func onResume() {
         Task { @MainActor in
+            guard self.transitionLifecycle(to: .active) else { return }
             MeetingViewModel.shared.handleAppBecameActive()
         }
     }
@@ -107,10 +110,14 @@ public final class ConclaveAppDelegate: Sendable {
     }
 
     public func onPause() {
+        Task { @MainActor in
+            _ = self.transitionLifecycle(to: .inactive)
+        }
     }
 
     public func onStop() {
         Task { @MainActor in
+            guard self.transitionLifecycle(to: .background) else { return }
             MeetingViewModel.shared.handleAppEnteredBackground()
         }
     }
@@ -119,6 +126,18 @@ public final class ConclaveAppDelegate: Sendable {
     }
 
     public func onLowMemory() {
+    }
+
+    @MainActor
+    private func transitionLifecycle(to next: ConclaveAppLifecyclePhase) -> Bool {
+        guard ConclaveAppLifecyclePolicy.shouldDeliver(
+            previous: lifecyclePhase,
+            next: next
+        ) else {
+            return false
+        }
+        lifecyclePhase = next
+        return true
     }
 
     @MainActor
