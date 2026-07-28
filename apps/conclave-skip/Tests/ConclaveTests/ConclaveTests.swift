@@ -4610,6 +4610,7 @@ final class ConclaveTests: XCTestCase {
         viewModel.state.connectionState = ConnectionState.joined
         viewModel.state.isMuted = false
         viewModel.state.isCameraOff = false
+        viewModel.state.isAudioOnlyMode = true
         viewModel.state.isScreenSharing = true
         viewModel.state.activeScreenShareUserId = viewModel.state.userId
 
@@ -4617,8 +4618,24 @@ final class ConclaveTests: XCTestCase {
 
         XCTAssertTrue(viewModel.state.isMuted)
         XCTAssertTrue(viewModel.state.isCameraOff)
+        XCTAssertFalse(viewModel.state.isAudioOnlyMode)
         XCTAssertFalse(viewModel.state.isScreenSharing)
         XCTAssertNil(viewModel.state.activeScreenShareUserId)
+    }
+
+    @MainActor
+    func testAudioOnlyImmediatelyDisablesCameraIntent() {
+        let viewModel = MeetingViewModel()
+        viewModel.state = MeetingState(userId: "local@example.com#local-session", sessionId: "local-session")
+        viewModel.state.roomId = "room-a"
+        viewModel.state.connectionState = ConnectionState.joined
+        viewModel.state.isCameraOff = false
+
+        viewModel.setAudioOnlyMode(true)
+        viewModel.toggleCamera()
+
+        XCTAssertTrue(viewModel.state.isAudioOnlyMode)
+        XCTAssertTrue(viewModel.state.isCameraOff)
     }
     #endif
 

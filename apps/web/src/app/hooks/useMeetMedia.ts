@@ -116,6 +116,7 @@ interface UseMeetMediaOptions {
   setIsMuted: (value: boolean) => void;
   isCameraOff: boolean;
   setIsCameraOff: (value: boolean) => void;
+  cameraDisabled?: boolean;
   isScreenSharing: boolean;
   setIsScreenSharing: (value: boolean) => void;
   activeScreenShareId: string | null;
@@ -497,6 +498,7 @@ export function useMeetMedia({
   setIsMuted,
   isCameraOff,
   setIsCameraOff,
+  cameraDisabled = false,
   isScreenSharing,
   setIsScreenSharing,
   activeScreenShareId,
@@ -777,6 +779,8 @@ export function useMeetMedia({
   useEffect(() => {
     isCameraOffRef.current = isCameraOff;
   }, [isCameraOff]);
+  const videoPublishingDisabledRef = useRef(cameraDisabled);
+  videoPublishingDisabledRef.current = cameraDisabled;
   const isScreenSharingRef = useRef(isScreenSharing);
   useEffect(() => {
     isScreenSharingRef.current = isScreenSharing;
@@ -3917,6 +3921,7 @@ export function useMeetMedia({
 
   const toggleCamera = useCallback(async () => {
     if (isObserverMode) return;
+    if (videoPublishingDisabledRef.current && isCameraOff) return;
     if (toggleCameraInFlightRef.current) return;
     toggleCameraInFlightRef.current = true;
 
@@ -4010,6 +4015,12 @@ export function useMeetMedia({
           createdTrack = videoTrack ?? null;
 
           if (!videoTrack) throw new Error("No video track obtained");
+          if (videoPublishingDisabledRef.current) {
+            stopLocalTrack(videoTrack);
+            createdTrack = null;
+            setIsCameraOff(true);
+            return;
+          }
           applyCameraContentHint(videoTrack);
           attachLocalVideoTrackHandlers(videoTrack);
           videoTrack.onended = () => {
@@ -4032,6 +4043,24 @@ export function useMeetMedia({
             videoTrack,
           );
           attachLocalVideoTrackHandlers(publishTrack);
+          if (videoPublishingDisabledRef.current) {
+            stopLocalTrack(videoTrack);
+            const currentStream = localStreamRef.current;
+            if (currentStream?.getTracks().includes(videoTrack)) {
+              commitLocalStream(
+                new MediaStream(
+                  currentStream
+                    .getTracks()
+                    .filter(
+                      (track) => track !== videoTrack && track.kind !== "video",
+                    ),
+                ),
+              );
+            }
+            createdTrack = null;
+            setIsCameraOff(true);
+            return;
+          }
 
           const quality = videoQualityRef.current;
           const networkProfile = getPublishNetworkProfile();
@@ -4052,6 +4081,33 @@ export function useMeetMedia({
             preferredCodec: preferredWebcamCodec,
             context: "camera-toggle",
           });
+
+          if (videoPublishingDisabledRef.current) {
+            socketRef.current?.emit(
+              "closeProducer",
+              { producerId: videoProducer.id },
+              () => {},
+            );
+            try {
+              videoProducer.close();
+            } catch {}
+            stopLocalTrack(videoTrack);
+            const currentStream = localStreamRef.current;
+            if (currentStream?.getTracks().includes(videoTrack)) {
+              commitLocalStream(
+                new MediaStream(
+                  currentStream
+                    .getTracks()
+                    .filter(
+                      (track) => track !== videoTrack && track.kind !== "video",
+                    ),
+                ),
+              );
+            }
+            createdTrack = null;
+            setIsCameraOff(true);
+            return;
+          }
 
           videoProducerRef.current = videoProducer;
           const videoProducerId = videoProducer.id;
@@ -4111,6 +4167,7 @@ export function useMeetMedia({
   useEffect(() => {
     if (isObserverMode) return;
     if (connectionState !== "joined") return;
+    if (cameraDisabled) return;
     if (isCameraOff) return;
     if (isMediaRecoveryBlocked()) return;
 
@@ -5221,7 +5278,7 @@ export function useMeetMedia({
           context: "camera-recovery",
         });
 
-        if (cancelled) {
+        if (cancelled || videoPublishingDisabledRef.current) {
           try {
             recoveredProducer.close();
           } catch {}
@@ -5286,6 +5343,7 @@ export function useMeetMedia({
   }, [
     isObserverMode,
     connectionState,
+    cameraDisabled,
     cameraProducerRecoveryPulse,
     isCameraOff,
     isMediaRecoveryBlocked,
@@ -5722,6 +5780,8 @@ export function useMeetMedia({
       return;
     }
 
+    if (videoPublishingDisabledRef.current) return;
+
     if (activeScreenShareId) {
       setMeetError({
         code: "UNKNOWN",
@@ -5739,6 +5799,7 @@ export function useMeetMedia({
       if (!transport) {
         const transportReady =
           (await ensureProducerTransportRef?.current?.()) ?? false;
+        if (videoPublishingDisabledRef.current) return;
         transport = getUsableProducerTransport(producerTransportRef.current);
         if (!transportReady || !transport) {
           throw new Error("Screen share transport unavailable");
@@ -5806,6 +5867,11 @@ export function useMeetMedia({
         }
       }
       acquiredScreenShareStream = stream;
+      if (videoPublishingDisabledRef.current) {
+        stopScreenShareStream(stream);
+        resetScreenShareControlState();
+        return;
+      }
       const track = stream.getVideoTracks()[0];
       if (!track) {
         throw new Error("Screen share did not include a video track");
@@ -5829,6 +5895,11 @@ export function useMeetMedia({
         screenNetworkProfile,
         screenPublishSettings,
       );
+      if (videoPublishingDisabledRef.current) {
+        stopScreenShareStream(stream);
+        resetScreenShareControlState();
+        return;
+      }
 
       const preferredScreenShareCodec = getPreferredScreenShareCodec(
         deviceRef.current,
@@ -5840,6 +5911,20 @@ export function useMeetMedia({
         preferredCodec: preferredScreenShareCodec,
         publishSettings: screenPublishSettings,
       });
+
+      if (videoPublishingDisabledRef.current) {
+        socketRef.current?.emit(
+          "closeProducer",
+          { producerId: producer.id },
+          () => {},
+        );
+        try {
+          producer.close();
+        } catch {}
+        stopScreenShareStream(stream);
+        resetScreenShareControlState();
+        return;
+      }
 
       screenShareStreamRef.current = stream;
       screenProducerRef.current = producer;
@@ -5909,6 +5994,11 @@ export function useMeetMedia({
         );
       }
 
+      if (videoPublishingDisabledRef.current) {
+        finishScreenShare();
+        return;
+      }
+
       const audioTrack = stream.getAudioTracks()[0];
       if (audioTrack && audioTrack.readyState === "live") {
         try {
@@ -5940,6 +6030,7 @@ export function useMeetMedia({
           }
 
           if (
+            videoPublishingDisabledRef.current ||
             screenVideoEnded ||
             track.readyState !== "live" ||
             screenShareStreamRef.current !== stream

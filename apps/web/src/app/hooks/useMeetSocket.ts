@@ -923,6 +923,7 @@ interface UseMeetSocketOptions {
   activeVideoEffectsCount?: number;
   connectionQualityRef?: React.MutableRefObject<ConnectionQualityStats | null>;
   dataSaverMode?: boolean;
+  audioOnlyMode?: boolean;
   isDocumentVisible?: boolean;
   updateVideoQualityRef: React.MutableRefObject<
     (
@@ -1035,6 +1036,7 @@ export function useMeetSocket({
   activeVideoEffectsCount = 0,
   connectionQualityRef,
   dataSaverMode = false,
+  audioOnlyMode = false,
   isDocumentVisible = true,
   updateVideoQualityRef,
   requestMediaPermissions,
@@ -1150,6 +1152,11 @@ export function useMeetSocket({
   const announcedRemoteProducersRef = useRef<Map<string, ProducerInfo>>(
     new Map(),
   );
+  const suppressedVideoProducersRef = useRef<Map<string, ProducerInfo>>(
+    new Map(),
+  );
+  const audioOnlyModeRef = useRef(audioOnlyMode);
+  audioOnlyModeRef.current = audioOnlyMode;
   const pendingScreenProducerCloseIdsRef = useRef<Set<string>>(new Set());
   const screenShareRepublishPromiseRef = useRef<Promise<boolean> | null>(null);
   // Announce-order bookkeeping for producers, per participant slot
@@ -1899,6 +1906,7 @@ export function useMeetSocket({
       consumerRecoveryInFlightRef.current.clear();
       consumerConsumeInFlightRef.current.clear();
       announcedRemoteProducersRef.current.clear();
+      suppressedVideoProducersRef.current.clear();
       consumerTelemetryRef.current.clear();
       pendingConsumerTelemetryByIdRef.current.clear();
       producerMapRef.current.clear();
@@ -3014,6 +3022,7 @@ export function useMeetSocket({
       forgetAnnouncedProducer(producerId);
       mutedConsumerSinceRef.current.delete(producerId);
       producerPausedStateRef.current.delete(producerId);
+      suppressedVideoProducersRef.current.delete(producerId);
       producerPausedStateRevisionRef.current.delete(producerId);
       adaptivelyPausedConsumerProducerIdsRef.current.delete(producerId);
       consumerTelemetryRef.current.delete(producerId);
@@ -3194,6 +3203,7 @@ export function useMeetSocket({
       consumerRecoveryInFlightRef,
       producerMapRef,
       announcedRemoteProducersRef,
+      suppressedVideoProducersRef,
       clearStaleReplacementCleanupTimeout,
       setActiveScreenShareId,
       settleWebcamStartupLatencyReset,
@@ -3527,6 +3537,7 @@ export function useMeetSocket({
       }
 
       announcedRemoteProducersRef.current.delete(producerId);
+      suppressedVideoProducersRef.current.delete(producerId);
       pendingProducersRef.current.delete(producerId);
       consumeRetryAttemptsRef.current.delete(producerId);
       producerPausedStateRef.current.delete(producerId);
@@ -3541,6 +3552,7 @@ export function useMeetSocket({
       pendingProducersRef,
       producerMapRef,
       producerPausedStateRef,
+      suppressedVideoProducersRef,
     ],
   );
 
@@ -4415,6 +4427,14 @@ export function useMeetSocket({
       if (producerInfo.producerUserId === userId) {
         return;
       }
+      if (audioOnlyModeRef.current && producerInfo.kind === "video") {
+        suppressedVideoProducersRef.current.set(
+          producerInfo.producerId,
+          producerInfo,
+        );
+        pendingProducersRef.current.delete(producerInfo.producerId);
+        return;
+      }
       if (shouldIgnoreDepartedParticipant(producerInfo.producerUserId)) {
         dropDepartedProducer(producerInfo);
         return;
@@ -4575,6 +4595,17 @@ export function useMeetSocket({
                 acknowledgedProducerPaused,
               );
             }
+            if (audioOnlyModeRef.current && producerInfo.kind === "video") {
+              suppressedVideoProducersRef.current.set(
+                producerInfo.producerId,
+                producerInfo,
+              );
+              pendingConsumerTelemetryByIdRef.current.delete(response.id);
+              void closeServerConsumer(response.id);
+              pendingProducersRef.current.delete(producerInfo.producerId);
+              resolve();
+              return;
+            }
 
             try {
               const consumer = await transport.consume({
@@ -4608,6 +4639,17 @@ export function useMeetSocket({
                 }
                 void closeServerConsumer(consumer.id);
               };
+              if (audioOnlyModeRef.current && response.kind === "video") {
+                suppressedVideoProducersRef.current.set(
+                  producerInfo.producerId,
+                  producerInfo,
+                );
+                await discardUncommittedConsumer({
+                  confirmRollback: Boolean(options.makeBeforeBreak),
+                });
+                resolve();
+                return;
+              }
               if (!isCapturedConsumeContextCurrent(consumer)) {
                 await discardUncommittedConsumer({
                   confirmRollback: Boolean(options.makeBeforeBreak),
@@ -5278,18 +5320,67 @@ export function useMeetSocket({
       shouldIgnoreDepartedParticipant,
       videoStallRecoveryTimeoutsRef,
       staleConsumerRecoveryTimeoutsRef,
+      audioOnlyModeRef,
       adaptivelyPausedConsumerProducerIdsRef,
       clearStaleConsumerRecoveryTimeout,
       mutedConsumerSinceRef,
       producerPausedStateRef,
       setProducerPausedState,
       announcedRemoteProducersRef,
+      suppressedVideoProducersRef,
       dataSaverMode,
       isDocumentVisible,
       userId,
     ],
   );
   consumeProducerRef.current = consumeProducer;
+
+  useEffect(() => {
+    if (audioOnlyMode) {
+      consumersRef.current.forEach((consumer, producerId) => {
+        if (consumer.kind !== "video") return;
+        const producer = producerMapRef.current.get(producerId);
+        if (producer) {
+          suppressedVideoProducersRef.current.set(producerId, {
+            producerId,
+            producerUserId: producer.userId,
+            kind: producer.kind,
+            type: producer.type,
+            paused: producerPausedStateRef.current.get(producerId),
+          });
+          dispatchParticipants({
+            type: "UPDATE_STREAM",
+            userId: producer.userId,
+            kind: "video",
+            streamType: producer.type,
+            stream: null,
+            producerId,
+          });
+          if (producer.type === "screen") setActiveScreenShareId(null);
+        }
+        void closeServerConsumer(consumer.id);
+        closeConsumerForSameProducerReconsume(producerId, consumer);
+      });
+      return;
+    }
+
+    const suppressedProducers = Array.from(
+      suppressedVideoProducersRef.current.values(),
+    );
+    suppressedVideoProducersRef.current.clear();
+    suppressedProducers.forEach((producer) => void consumeProducer(producer));
+  }, [
+    audioOnlyMode,
+    closeConsumerForSameProducerReconsume,
+    closeServerConsumer,
+    consumeProducer,
+    consumersRef,
+    dispatchParticipants,
+    producerMapRef,
+    producerPausedStateRef,
+    setActiveScreenShareId,
+    suppressedVideoProducersRef,
+  ]);
 
   const scheduleWebcamStartupLatencyResetTimeout = useCallback(
     (producerId: string, callback: () => void, delayMs: number) => {

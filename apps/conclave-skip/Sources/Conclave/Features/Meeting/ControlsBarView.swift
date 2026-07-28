@@ -209,8 +209,10 @@ struct ControlsBarView: View {
         let isWebinarAttendee = viewModel.state.isWebinarAttendee
         let canUseParticipantActions = isJoinedCall
             && !isWebinarAttendee
+        let cameraControlDisabled = mediaControlsDisabled || viewModel.state.isAudioOnlyMode
         let isScreenShareDisabled = !isJoinedCall || viewModel.state.mediaPublishingDisabled ||
-            viewModel.state.hasActiveRemoteScreenShare
+            viewModel.state.hasActiveRemoteScreenShare ||
+            (viewModel.state.isAudioOnlyMode && !viewModel.state.isScreenSharing)
 
         HStack(spacing: layout.itemSpacing) {
             if !isWebinarAttendee {
@@ -250,13 +252,15 @@ struct ControlsBarView: View {
                     ControlButton(
                         icon: cameraIcon,
                         isMuted: viewModel.state.isCameraOff,
-                        isDisabledDimmed: mediaControlsDisabled,
+                        isDisabledDimmed: cameraControlDisabled,
                         accessibilityLabel: viewModel.state.isCameraOff ? "Turn camera on" : "Turn camera off",
-                        accessibilityHint: recoveryControlHint
+                        accessibilityHint: viewModel.state.isAudioOnlyMode
+                            ? "Camera is disabled in audio-only mode."
+                            : recoveryControlHint
                     ) {
                     viewModel.toggleCamera()
                 }
-                .disabled(mediaControlsDisabled)
+                .disabled(cameraControlDisabled)
 
                 if viewModel.state.isScreenShareSupported {
                     ControlButton(

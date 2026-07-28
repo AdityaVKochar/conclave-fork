@@ -52,6 +52,7 @@ export interface ControlsBarProps {
   isMuted: boolean;
   isMuteTogglePending?: boolean;
   isCameraOff: boolean;
+  isAudioOnly?: boolean;
   isScreenSharing: boolean;
   activeScreenShareId: string | null;
   isChatOpen: boolean;
@@ -219,7 +220,8 @@ function canManageDevPlayground(p: ControlsBarProps): boolean {
 
 export function buildControlsConfig(p: ControlsBarProps): ControlsConfig {
   const canStartScreenShare = !p.activeScreenShareId || p.isScreenSharing;
-  const screenShareDisabled = !canStartScreenShare;
+  const screenShareDisabled =
+    !canStartScreenShare || Boolean(p.isAudioOnly && !p.isScreenSharing);
   // When the Apps launcher exists, every SDK app (whiteboard, watch, dev
   // playground) plus the editing lock lives in the Apps panel; their rows go
   // palette-only instead of doubling up in the More menu.
@@ -300,9 +302,14 @@ export function buildControlsConfig(p: ControlsBarProps): ControlsConfig {
     {
       id: "camera",
       icon: p.isCameraOff ? VideoOff : Video,
-      label: p.isCameraOff ? "Turn on camera" : "Turn off camera",
+      label: p.isAudioOnly
+        ? "Camera disabled in audio-only mode"
+        : p.isCameraOff
+          ? "Turn on camera"
+          : "Turn off camera",
       hotkey: HOTKEYS.toggleCamera.keys,
       variant: p.isCameraOff ? "muted" : "default",
+      disabled: p.isAudioOnly,
       onPress: p.onToggleCamera,
     },
   ];
@@ -319,7 +326,9 @@ export function buildControlsConfig(p: ControlsBarProps): ControlsConfig {
   const screenShareDescriptor: ControlDescriptor = {
     id: "screen-share",
     icon: Monitor,
-    label: !canStartScreenShare
+    label: p.isAudioOnly && !p.isScreenSharing
+      ? "Screen sharing disabled in audio-only mode"
+      : !canStartScreenShare
       ? "Someone else is presenting"
       : p.isScreenSharing
         ? "Stop sharing"
