@@ -32,6 +32,13 @@ afterEach(() => {
 });
 
 describe("resolveSfuUrls", () => {
+  it("uses the local SFU when development has no explicit configuration", () => {
+    clearSfuEnv();
+    process.env.NODE_ENV = "development";
+
+    expect(resolveSfuUrls()).toEqual(["http://localhost:3031"]);
+  });
+
   it("uses explicit pool urls without appending singleton fallback urls", () => {
     clearSfuEnv();
     process.env.SFU_URLS = "https://sfu-a.acmvit.in,https://sfu-b.acmvit.in";

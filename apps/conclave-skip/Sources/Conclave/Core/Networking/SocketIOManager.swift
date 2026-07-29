@@ -100,6 +100,7 @@ private enum SocketEvent {
     static let toggleCamera = SfuClientEvent.toggleCamera.rawValue
     static let closeProducer = SfuClientEvent.closeProducer.rawValue
     static let sendChat = SfuClientEvent.sendChat.rawValue
+    static let chatReact = SfuClientEvent.chatReact.rawValue
     static let chatImageUploadAuthorize = SfuClientEvent.chatImageUploadAuthorize.rawValue
     static let conclaveAuthorize = SfuClientEvent.conclaveAuthorize.rawValue
     static let conclaveAnswer = SfuClientEvent.conclaveAnswer.rawValue
@@ -155,6 +156,13 @@ private enum SocketEvent {
     static let webinarUpdateConfig = SfuClientEvent.webinarUpdateConfig.rawValue
     static let webinarGenerateLink = SfuClientEvent.webinarGenerateLink.rawValue
     static let webinarRotateLink = SfuClientEvent.webinarRotateLink.rawValue
+    static let webinarQaSubmit = SfuClientEvent.webinarQaSubmit.rawValue
+    static let webinarQaUpvote = SfuClientEvent.webinarQaUpvote.rawValue
+    static let webinarQaModerate = SfuClientEvent.webinarQaModerate.rawValue
+    static let webinarSetHandRaised = SfuClientEvent.webinarSetHandRaised.rawValue
+    static let webinarDeclineStage = SfuClientEvent.webinarDeclineStage.rawValue
+    static let webinarPromoteAttendee = SfuClientEvent.webinarPromoteAttendee.rawValue
+    static let webinarDemoteParticipant = SfuClientEvent.webinarDemoteParticipant.rawValue
     static let browserLaunch = SfuClientEvent.browserLaunch.rawValue
     static let browserNavigate = SfuClientEvent.browserNavigate.rawValue
     static let browserClose = SfuClientEvent.browserClose.rawValue
@@ -192,6 +200,7 @@ private enum SocketEvent {
     static let chatMessage = SfuServerEvent.chatMessage.rawValue
     static let conclaveMessage = SfuServerEvent.conclaveMessage.rawValue
     static let chatHistorySnapshot = SfuServerEvent.chatHistorySnapshot.rawValue
+    static let chatReactionChanged = SfuServerEvent.chatReactionChanged.rawValue
     static let reaction = SfuServerEvent.reaction.rawValue
     static let handRaised = SfuServerEvent.handRaised.rawValue
     static let handRaisedSnapshot = SfuServerEvent.handRaisedSnapshot.rawValue
@@ -233,6 +242,11 @@ private enum SocketEvent {
     static let webinarAttendeeCountChanged = SfuServerEvent.webinarAttendeeCountChanged.rawValue
     static let webinarFeedChanged = SfuServerEvent.webinarFeedChanged.rawValue
     static let webinarParticipantJoined = SfuServerEvent.webinarParticipantJoined.rawValue
+    static let webinarQaChanged = SfuServerEvent.webinarQaChanged.rawValue
+    static let webinarQaSnapshot = SfuServerEvent.webinarQaSnapshot.rawValue
+    static let webinarHandQueueChanged = SfuServerEvent.webinarHandQueueChanged.rawValue
+    static let webinarPromoted = SfuServerEvent.webinarPromoted.rawValue
+    static let webinarDemoted = SfuServerEvent.webinarDemoted.rawValue
     static let browserState = SfuServerEvent.browserState.rawValue
     static let browserClosed = SfuServerEvent.browserClosed.rawValue
     static let appsState = SfuServerEvent.appsState.rawValue
@@ -320,6 +334,11 @@ final class SocketIOManager {
     var onWebinarAttendeeCountChanged: ((WebinarAttendeeCountChangedNotification) -> Void)?
     var onWebinarFeedChanged: ((WebinarFeedChangedNotification) -> Void)?
     var onWebinarParticipantJoined: ((WebinarParticipantJoinedNotification) -> Void)?
+    var onWebinarQaChanged: ((WebinarQaChangedNotification) -> Void)?
+    var onWebinarQaSnapshot: ((WebinarQaSnapshot) -> Void)?
+    var onWebinarHandQueueChanged: ((WebinarHandQueueChangedNotification) -> Void)?
+    var onWebinarPromoted: ((WebinarPromotedNotification) -> Void)?
+    var onWebinarDemoted: ((WebinarDemotedNotification) -> Void)?
     var onBrowserState: ((BrowserStateNotification) -> Void)?
     var onBrowserClosed: ((BrowserClosedNotification) -> Void)?
     var onAppsState: ((AppsStateNotification) -> Void)?
@@ -349,6 +368,7 @@ final class SocketIOManager {
     // Chat/Reactions
     var onChatMessage: ((ChatMessage) -> Void)?
     var onChatHistorySnapshot: ((ChatHistorySnapshotNotification) -> Void)?
+    var onChatReactionChanged: ((ChatReactionChangedNotification) -> Void)?
     var onReaction: ((Reaction) -> Void)?
 
     // Hand raise
@@ -940,14 +960,26 @@ final class SocketIOManager {
 
     // MARK: - Chat
 
-    func sendChat(content: String, gif: ChatGifAttachment? = nil, recipient: String? = nil, replyTo: ChatReplyPreview? = nil) async throws -> ChatMessage {
-        let request = SendChatRequest(content: content, gif: gif, recipient: recipient, replyTo: replyTo)
+    func sendChat(content: String, gif: ChatGifAttachment? = nil, image: ChatImageAttachment? = nil, recipient: String? = nil, replyTo: ChatReplyPreview? = nil) async throws -> ChatMessage {
+        let request = SendChatRequest(content: content, gif: gif, image: image, recipient: recipient, replyTo: replyTo)
         let data = try await emit(event: SocketEvent.sendChat, payload: request)
         let response = try JSONDecoder().decode(SendChatResponse.self, from: data)
         guard let message = response.message else {
             throw SocketError.serverError("Missing chat message acknowledgement.")
         }
         return message.chatMessage(taggedRoomId: activeRoomId)
+    }
+
+    /// Asks the SFU for a short-lived upload slot for a chat image; the bytes
+    /// are then POSTed to `uploadUrl` with the bearer token (see
+    /// MeetingViewModel.sendChatImageAttachment).
+    func authorizeChatImageUpload() async throws -> ChatImageUploadAuthorization {
+        // The server handler is `(_data, callback)`, so a real (empty) payload
+        // must fill the first slot - an ack-only emit binds the ack function to
+        // `_data` and the callback never fires (mirror of the getProducers
+        // gotcha above, in the other direction).
+        let data = try await emit(event: SocketEvent.chatImageUploadAuthorize, payload: EmptySocketPayload())
+        return try JSONDecoder().decode(ChatImageUploadAuthorizationAck.self, from: data).authorization()
     }
 
     func requestConclaveAuthorization(answerId: String, questionMessageId: String) async throws -> ConclaveAuthorizeResponse {
@@ -1529,6 +1561,10 @@ final class SocketIOManager {
             }
         }
     }
+
+    /// Empty `{}` payload for handlers declared `(_data, callback)` that carry
+    /// no request fields but still need the first argument slot filled.
+    struct EmptySocketPayload: Encodable {}
 
     func emit<T: Encodable>(
         event: String,
@@ -2140,6 +2176,14 @@ final class SocketIOManager {
             self.onChatHistorySnapshot?(notification)
         }
 
+        socket.on(SocketEvent.chatReactionChanged) { [weak self] data, _ in
+            guard let self, let first = data.first,
+                  self.socket === socket,
+                  let notification = self.decode(ChatReactionChangedNotification.self, from: first),
+                  self.eventRoomIdMatchesActiveOrPending(notification.roomId) else { return }
+            self.onChatReactionChanged?(notification)
+        }
+
         socket.on(SocketEvent.reaction) { [weak self] data, _ in
             guard let self, let first = data.first,
                   self.socket === socket,
@@ -2472,6 +2516,46 @@ final class SocketIOManager {
                   let notification = self.decode(WebinarParticipantJoinedNotification.self, from: first),
                   self.eventRoomIdMatchesActiveOrPending(notification.roomId) else { return }
             self.onWebinarParticipantJoined?(notification)
+        }
+
+        socket.on(SocketEvent.webinarQaChanged) { [weak self] data, _ in
+            guard let self, let first = data.first,
+                  self.socket === socket,
+                  let notification = self.decode(WebinarQaChangedNotification.self, from: first),
+                  self.eventRoomIdMatchesActiveOrPending(notification.roomId) else { return }
+            self.onWebinarQaChanged?(notification)
+        }
+
+        socket.on(SocketEvent.webinarQaSnapshot) { [weak self] data, _ in
+            guard let self, let first = data.first,
+                  self.socket === socket,
+                  let notification = self.decode(WebinarQaSnapshot.self, from: first),
+                  self.eventRoomIdMatchesActiveOrPending(notification.roomId) else { return }
+            self.onWebinarQaSnapshot?(notification)
+        }
+
+        socket.on(SocketEvent.webinarHandQueueChanged) { [weak self] data, _ in
+            guard let self, let first = data.first,
+                  self.socket === socket,
+                  let notification = self.decode(WebinarHandQueueChangedNotification.self, from: first),
+                  self.eventRoomIdMatchesActiveOrPending(notification.roomId) else { return }
+            self.onWebinarHandQueueChanged?(notification)
+        }
+
+        socket.on(SocketEvent.webinarPromoted) { [weak self] data, _ in
+            guard let self, let first = data.first,
+                  self.socket === socket,
+                  let notification = self.decode(WebinarPromotedNotification.self, from: first),
+                  self.eventRoomIdMatchesActiveOrPending(notification.roomId) else { return }
+            self.onWebinarPromoted?(notification)
+        }
+
+        socket.on(SocketEvent.webinarDemoted) { [weak self] data, _ in
+            guard let self, let first = data.first,
+                  self.socket === socket,
+                  let notification = self.decode(WebinarDemotedNotification.self, from: first),
+                  self.eventRoomIdMatchesActiveOrPending(notification.roomId) else { return }
+            self.onWebinarDemoted?(notification)
         }
 
         socket.on(SocketEvent.browserState) { [weak self] data, _ in

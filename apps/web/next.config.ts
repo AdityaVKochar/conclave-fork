@@ -85,9 +85,6 @@ const nextConfig: NextConfig = {
       "y-protocols": yProtocolsTurbopackAlias,
     },
   },
-  experimental: {
-    turbopackFileSystemCacheForBuild: true,
-  },
   async redirects() {
     return [
       {

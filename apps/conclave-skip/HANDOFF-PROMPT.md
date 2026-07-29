@@ -1,33 +1,77 @@
-# Kickoff prompt - Conclave native polish & performance
+# Kickoff prompt - Conclave native: total parity, visual excellence, production release
 
-You are picking up the Conclave **native** app at `apps/conclave-skip` (a Skip app: one Swift codebase transpiled to Kotlin/Compose for Android and compiled natively for iOS). Your job is to finish the meeting-entry experience, fix the outstanding correctness bugs, and make the Android app **buttery smooth** - it currently feels laggy and sluggish (join screen, sheets especially, and in-meeting), and native apps should feel instant.
+You are working on the Conclave **native** app at `apps/conclave-skip` - a Skip app: one Swift codebase, transpiled to Kotlin/Compose for Android, compiled natively for iOS. The web app (`apps/web`) is the design and behavior reference and is in good shape. Your goal is to take native to **total parity with the web, looking genuinely good, and performing like a native app should**, ready for a full production release on both stores. The bar is a first-time user thinking "this is a really good experience" - nothing less.
 
-## First, read the handoff
-`apps/conclave-skip/HANDOFF.md` is the source of truth. **Read it completely before writing any code.** It contains the exact build/install/test commands, the non-obvious gotchas (Skip transpile traps, the SkipUI `onChange` null-crash pattern, R8/minify constraints, adb/device-testing quirks), the file index, and the detailed bug write-ups. Do not rediscover what's already documented there.
+**Read `apps/conclave-skip/AGENTS.md` completely before writing any code.** It is the living playbook: build/install/verify commands, the Skip transpile gotchas, the SkipUI `onChange` crash pattern, sheet/Lottie/entry-overlay/game-stage rules, perf patterns, the device checklist, and two operational rules that will burn you if skipped (never run two Gradle invocations concurrently; prod rate-limits rapid room creation - reuse one room per test session). `HANDOFF.md` is historical; do not work from it.
 
-## Scope, in priority order
-Work these in order; don't move on until the current one is verified on a real device.
+---
 
-1. **P0 - Entry overlay reveal (HANDOFF §4.1).** The branded Lottie+audio takeover must stay up until the meeting is fully ready, then reliably fade to a settled meeting. It was seen **stuck black over a fully-joined meeting**, and neither the reveal task nor the 12 s safety timeout cleared it. Make overlay visibility a **pure function of observable state with a hard ceiling** - not a fire-and-forget `Task` that view churn can silently cancel. Handle every exit: joined, waiting (→ WaitingRoomView), error (→ branded error → setup), disconnected. Nothing may ever sit on black longer than the safety cap.
-2. **P0 - Lottie renders black on Android (§4.2).** The Conclave lockup shows as solid black via lottie-compose. Diagnose (dotLottie decode vs asset packaging vs invisible layer), fix, and confirm it actually animates on device. Confirm iOS renders it too.
-3. **P0 - Confirm the onChange NPE fix + guest New-meeting path (§4.3, §4.4).** The zero-param `onChange` conversion is in; confirm no `checkNotNullParameter` crash across a full meeting entry and chat/sheet/transcript toggles. Verify the guest "New meeting" tap actually starts a join (it no-opped in one clean retest).
-4. **P1 - Performance / "buttery" (§5).** This is the headline ask. The sluggishness is **over-broad recomposition**, not CPU work: reading big `@Observable` state (`MeetingViewModel.shared` / `state`) inside large view bodies recomposes huge subtrees on unrelated changes. Split large bodies into narrow-reading leaf views, pass primitives not the whole view model, isolate high-frequency state (active speaker / audio levels / stats), lighten and lazy-load the sheets, and remove animation/redraw churn. **Start with the sheets** - the user called them out specifically. Measure before/after with the Compose draw cadence (idle should be quiet, not 60fps).
-5. **P2 - Polish/parity smoke tests (§6).** Entry sound, and device-validate parity phases 1–6 (privacy policy, connection banners, GIF picker, game cards, Wordle, transcription), which compile but were never fully device-tested.
+## Ground truth (verified 2026-07-14 against git history)
+
+### Verified working (iOS simulator vs production, screenshot-evidenced in prior sessions)
+- Core loop: cold start → JoinView → guest create → branded Lottie entry overlay → settled meeting → controls/chat/sheets → hang up. Entry overlay has a policy-driven hard ceiling (never strands black); media state never self-flips.
+- Chat: web-parity bubbles (own = coral right, no avatar; peers = raised left with avatar), grouping, no send flicker (optimistic echo dedupe), full-bleed dock with bounded edges, GIF picker vs prod, long-press actions.
+- Transcript (as of the last verified pass): start-stage hero, status row, live listening state vs the prod worker.
+- Games: full catalog (Trivia, Bluff, WYR, Most Likely To, Reaction, Imposter, Wordle, Chess), cross-client play verified (moves scored by prod server), stage takeover, self-tile lives in the strip, flat headers, keyboard never collapses the stage (iOS).
+- Deep links (join-by-link → prejoin), bad-code error path, waiting room.
+- **TestFlight build 2.0.0 (50) uploaded, VALID, live to the internal "Conclave Testing" group.** Cut before the work below - a new build is needed.
+
+### Landed since (committed, builds green, but NOT runtime-verified anywhere)
+These ~14k lines are the first thing to truth-pass:
+- **WebRTC receiver-capacity system**: `Core/WebRTC/WebcamReceiverCapacity.swift` (policy-driven, heavily unit-tested), major rework in `WebRTCClient.swift` + `Skip/WebRTCClient+Android.kt`. Media-scale behavior - needs multi-client verification (tiles beyond capacity, layer switching, foreground/background).
+- **Transcript Ask + Minutes tabs** (`TranscriptPanelView.swift` tripled) with `Shared/NativeStreamingMarkdown.swift` for streamed answers, expanded `TranscriptService`/`TranscriptState`. Verify: tab switching, ask-a-question streaming, minutes sections, viewer vs controller.
+- **Animated reactions** (`Skip/AnimatedReactionAsset.kt`, `ReactionViews.swift`) and **native GIF picker sheet** (`Skip/FlexibleGifPickerSheetHost.kt`).
+- **Admit-all** (ParticipantsSheet button + socket) and **host promotion** (ParticipantsSheet flow + socket) - web shipped these; native has them wired but unproven.
+- Chat rework in `ChatViews.swift` (~900 lines churned), `MeetingBannerOverlay`, `PipManager`, `JoinView` deltas.
+
+### Parity gaps vs the web (web moved; native has nothing for these)
+1. **Chat image attachments** - the web sends images (clipboard paste + picker), renders `ChatImageAttachmentView`, and runs OpenAI moderation server-side. Native chat has zero image support (no model case, no renderer, no send path). This is the largest user-visible gap: images sent from web won't render on native today - confirm and fix rendering first, then add native send (photo picker; iOS paste).
+2. **Chat link embeds** - web renders unfurled link cards + tweet media (`ChatLinkEmbedView`); native renders plain link chips only.
+3. **Apps panel / Apps SDK** - web has an Apps dock (`AppsPanel.tsx`) with spin-the-wheel as the first app. Native renders an active app's stage (`ActiveAppLayoutView`) but check whether it can *launch* apps; build the picker if missing.
+4. Smaller web deltas to review for relevance: `ConclaveMessage` (assistant chat), `ChatOverlay` preview changes, `GridLayout`/`ParticipantVideo` behavior changes tied to receiver capacity. Desktop-only web features (CommandPalette, DeviceCaretMenu, MeetSettingsPanel, update pill) are explicitly out of scope for phones.
+
+### Store state
+- iOS listing metadata complete under `Darwin/fastlane/metadata/` (incl. corrected `app_privacy_details.json` - account data + product-interaction analytics; the old DATA_NOT_COLLECTED was false and must not return).
+- Play listing text exists (`Android/fastlane/metadata/android/en-US/`). The Data Safety worksheet and the 6.9" screenshot set were removed in a repo cleanup - **screenshots must be recaptured** (the flow is documented in AGENTS.md; resize/validate per the asc-screenshot-resize skill; this macOS lacks the sRGB ICC profile at the documented path - sim captures are already sRGB, skip that step).
+- Versions still `2.0.0 (50)` in the pbxproj (Skip propagates to Android). All post-50 work is not on TestFlight.
+- Still user-gated: Android release keystore, Play/ASC submission go-ahead, one data-retention confirmation (nothing outside the repo retains meeting content).
+
+---
+
+## Priorities, in order
+
+**A. Truth-pass the unverified work.** Sim harness first (see AGENTS.md: prod env overrides, `agent-device snapshot`/`click @ref`, one room per session). Cover: transcript Ask/Minutes end-to-end, animated reactions, GIF sheet, admit-all + host promotion (needs 2 clients - a headless web client via `playwright-core` + system Chrome works, guest flow reaches join), receiver-capacity sanity with 2+ publishers. On Android: the full AGENTS.md device checklist the moment a phone is present (`adb devices` first; a staged APK may be stale - rebuild). File every failure as a P0 and fix before moving on.
+
+**B. Close the parity gaps.** In user-impact order: chat image rendering → native image send → link embeds → apps panel/wheel. Match the web component's design exactly (read its code first - colors, radii, spacing, states); reuse the native design tokens (`ACMColors`, `ACMFont`, `ACMRadius`, `ACMSpacing`).
+
+**C. Experience pass.** Visual: sweep every surface against the web side-by-side (join, meeting grid/spotlight, all sheets, chat, transcript, games, waiting/error) and fix taste issues - alignment, spacing rhythm, type hierarchy, empty states. Performance: device-measured only (ConclavePerf + `setRequestedFrameRate` cadence; `pm compile -m speed` after installs) - idle meeting must be quiet, sheets/chat/lobby buttery. Never ship a speculative perf change without a device before/after.
+
+**D. Release train.** Bump to `2.1.0 (51)` in the pbxproj when the truth pass is green. iOS: archive → TestFlight via `asc` (the flow that shipped build 50: cloud signing with the team + the ASC auth key from `~/.appstoreconnect/private_keys/`; `asc apps list` to confirm identity; export with `destination=upload --wait`). Recapture the 6.9" screenshot set from real flows. Android: signed AAB the moment the user provides the keystore. Surface the remaining user asks explicitly at the end of every session.
+
+---
 
 ## Non-negotiable constraints
-- **No gradients. Anywhere.** Flat solid surfaces + 1px borders + the single coral accent. The web app has zero gradients; native must match. This is a hard design law.
-- **Keep iOS green.** Every change must keep `swift build` compiling and `swift test` passing - you're editing one Swift source for both platforms.
-- **Do not re-enable R8/minification.** The release build is intentionally un-minified because R8 breaks SkipUI two ways (onChange NPE + Preference NPE). This is explained in the handoff; don't "fix" it.
-- **Verify on the real device, not just by building.** A green build is necessary, not sufficient. Install the release APK and confirm behavior with screenshots + uiautomator dumps (dump to a file - see the handoff; screenshots can lie about what's actually on screen). App logs are NO-OP on Android, so trace via the UI tree or a temporary on-screen debug readout.
+
+- **No gradients. Anywhere. Ever.** Flat solid surfaces, 1px borders, single coral accent. Run the AGENTS.md gradient scan before calling any UI work done. Functional state colors (success green, warning amber, transcript live-blue) are fine; a second brand accent is not.
+- **No em dashes in anything you write** - code, comments, docs, commit messages, store copy. The user has banned them; grep before finishing.
+- **Keep iOS green**: `swift build` + `swift test` (large suite - keep it passing; some tests assert source *shape*, e.g. cached-presentation rules - respect their intent rather than deleting them).
+- **Android compile is part of done for every change**: `:Conclave:compileDebugKotlin` minimum, `assembleRelease` before device work. iOS-only validation has shipped Android-breaking Swift twice (`.map(String.init)`).
+- **Do not re-enable R8/minification.** Documented SkipUI breakage.
+- **Runtime proof or it did not happen.** Sim proof for iOS, device proof for Android; screenshots or accessibility dumps as evidence; report "verified on sim" vs "verified on device" vs "build-only" precisely.
+- Use **agent-device only** for driving simulators (no computer-use). Prod SSH and anything credential-shaped needs the user's explicit approval.
 
 ## Working method
-- After each change: `swift build` (must say "Build complete!") → `gradle :Conclave:compileDebugKotlin` for a fast Kotlin gate → then the release APK when you're ready to test on device. Don't pipe builds through `tail`/`grep` in a way that hides the exit code.
-- Keep changes tight and idiomatic to the surrounding code. When you hit a Skip transpile error, consult the gotcha list before guessing.
-- Run your work through the codex CLI review loop the way this project prefers: implement → `codex exec -s read-only … < /dev/null` review → fix real findings → re-confirm → build. Fold caught bugs back in before moving on.
-- Don't commit or push unless asked. When P0 is verified, propose a focused commit.
 
-## Reporting / honesty
-Be precise about what you actually verified versus what you assume. If a build fails, show the error. If a device test is flaky or you couldn't reproduce, say so plainly - don't declare the overlay "fixed" because it compiled. Distinguish "confirmed on device" from "should work." Surface anything in the handoff that turns out to be wrong.
+1. Recon before code: `git log --oneline -15`, `git status`, read AGENTS.md deltas. The codebase moves between sessions - never assume continuity.
+2. Loop per change: implement → `swift build` → `:Conclave:compileDebugKotlin` → codex review (`codex exec -s read-only "..." < /dev/null`) → fix real findings → sim/device verify with evidence.
+3. Sequential Gradle only. One prod room per test session. Space out creates.
+4. Update AGENTS.md when you learn something durable (a gotcha, a pattern, a rule) - it is the only doc guaranteed to persist; standalone status docs get swept in cleanups.
+5. End every session with: what is verified where, what is in flight, what the user must provide next.
 
 ## Definition of done
-Every box in HANDOFF.md §7 is checked on a real device: clean cold start renders JoinView; New meeting (guest) shows a **visible** Lottie + sound overlay that **reveals a settled meeting within ~2 s of ready** with no device-init hiccup and no crash; join-by-code, bad code, and locked-room paths all behave; chat/sheets/transcript open without NPE and **feel smooth**; idle in-meeting draw cadence is quiet; the share sheet opens; and there are no gradients. Both platforms build green and `swift test` passes.
+
+- Every AGENTS.md device-checklist item passes on a real Android device AND the iOS core loop passes on sim/device, all on a build containing the receiver-capacity + transcript-tabs work.
+- The four parity gaps above are closed and verified cross-client against the web (web sends image → native renders it; native sends → web renders; embeds; apps).
+- A side-by-side visual sweep of every surface finds nothing that reads worse than the web.
+- Device-measured perf: quiet idle cadence, no jank on sheets/chat/lobby on the mid-range Android test phone.
+- TestFlight has a build ≥ 51 containing all of it; the Play AAB is one keystore away; screenshots and listings are current; the user has a single short list of what only they can do (keystore, submissions, retention confirmation).

@@ -1696,6 +1696,18 @@ internal class WebRTCClient : SendTransport.Listener, RecvTransport.Listener, Pr
     private var screenVideoTrackSequence = 0
     private var currentVideoQuality: VideoQuality = VideoQuality.standard
     private var currentLocalBandwidthQuality: ConnectionQuality = ConnectionQuality.unknown
+    private var configuredCameraWidth = 1_280
+    private var configuredCameraHeight = 720
+    private var configuredCameraFrameRate = 30
+    private var configuredCameraMaxBitrateBps = 1_650_000
+    private var configuredCameraContentHint = "motion"
+    private var configuredCameraDegradationPreference = "maintain-framerate"
+    private var configuredScreenMaxWidth = 3_840
+    private var configuredScreenMaxHeight = 2_160
+    private var configuredScreenFrameRate = 24
+    private var configuredScreenMaxBitrateBps = 2_500_000
+    private var configuredScreenContentHint = "detail"
+    private var configuredScreenDegradationPreference = "maintain-resolution"
     private var webcamProducerTopology: WebcamProducerTopology = WebcamProducerTopology.other
     private var webcamReceiverCapacityRoomId: String? = null
     private var webcamReceiverCapacityAuthorityAvailable = false
@@ -1713,6 +1725,7 @@ internal class WebRTCClient : SendTransport.Listener, RecvTransport.Listener, Pr
     private var videoProducerBandwidthSignature: String? = null
     private var lastWebcamProduceUsedSingleLayerFallback = false
     private var screenProducerBandwidthQuality: ConnectionQuality = ConnectionQuality.unknown
+    private var screenProducerBandwidthSignature: String? = null
     private var selectedAudioOutputDeviceId: String? = null
     private var selectedAudioInputDeviceId: String? = null
     private var audioDeviceCallback: AudioDeviceCallback? = null
@@ -1754,7 +1767,8 @@ internal class WebRTCClient : SendTransport.Listener, RecvTransport.Listener, Pr
     private var videoBandwidthRefreshInFlight = false
     private var screenBandwidthRefreshInFlight = false
     private var lastAppliedLocalBandwidthSignature: String? = null
-    private val screenShareTemporalLayerCount = 3
+    private val screenShareTemporalLayerCount: Int
+        get() = if (configuredScreenContentHint == "motion") 3 else 2
     private val audioRouteRecoveryScope = CoroutineScope(Dispatchers.Main.immediate + SupervisorJob())
 
     internal fun prewarmMediaStack() {
@@ -2259,6 +2273,7 @@ internal class WebRTCClient : SendTransport.Listener, RecvTransport.Listener, Pr
             producer.resume()
             screenProducer = producer
             screenProducerBandwidthQuality = currentLocalBandwidthQuality
+            screenProducerBandwidthSignature = localScreenBandwidthSignature(currentLocalBandwidthQuality)
             evaluateWebcamTopologyTransition()
             debugLog("[WebRTC] Screen sharing producer created: ${producer.id}")
         } catch (t: Throwable) {
@@ -2288,6 +2303,7 @@ internal class WebRTCClient : SendTransport.Listener, RecvTransport.Listener, Pr
         screenProducer?.close()
         screenProducer = null
         screenProducerBandwidthQuality = ConnectionQuality.unknown
+        screenProducerBandwidthSignature = null
         evaluateWebcamTopologyTransition()
         try {
             screenCapturer?.stopCapture()
@@ -3256,6 +3272,43 @@ internal class WebRTCClient : SendTransport.Listener, RecvTransport.Listener, Pr
         return producer
     }
 
+    internal fun updateMediaPublishConfiguration(
+        cameraWidth: Int,
+        cameraHeight: Int,
+        cameraFrameRate: Int,
+        cameraMaxBitrateBps: Int,
+        cameraContentHint: String,
+        cameraDegradationPreference: String,
+        screenMaxWidth: Int,
+        screenMaxHeight: Int,
+        screenFrameRate: Int,
+        screenMaxBitrateBps: Int,
+        screenContentHint: String,
+        screenDegradationPreference: String,
+    ) {
+        configuredCameraWidth = cameraWidth.coerceIn(160, 3_840)
+        configuredCameraHeight = cameraHeight.coerceIn(90, 2_160)
+        configuredCameraFrameRate = cameraFrameRate.coerceIn(5, 60)
+        configuredCameraMaxBitrateBps = cameraMaxBitrateBps.coerceIn(100_000, 12_000_000)
+        configuredCameraContentHint = cameraContentHint
+        configuredCameraDegradationPreference = cameraDegradationPreference
+        configuredScreenMaxWidth = screenMaxWidth.coerceIn(320, 3_840)
+        configuredScreenMaxHeight = screenMaxHeight.coerceIn(180, 2_160)
+        configuredScreenFrameRate = screenFrameRate.coerceIn(1, 60)
+        configuredScreenMaxBitrateBps = screenMaxBitrateBps.coerceIn(150_000, 15_000_000)
+        configuredScreenContentHint = screenContentHint
+        configuredScreenDegradationPreference = screenDegradationPreference
+        videoProducerBandwidthSignature = null
+        screenProducerBandwidthSignature = null
+        lastAppliedLocalBandwidthSignature = null
+        applyLocalBandwidthProfile(currentLocalBandwidthQuality)
+    }
+
+    internal suspend fun refreshLocalMediaForQualitySettings() {
+        refreshLocalVideoProducerForBandwidthProfile(currentLocalBandwidthQuality)
+        refreshLocalScreenProducerForBandwidthProfile(currentLocalBandwidthQuality)
+    }
+
     internal fun updateVideoQuality(quality: VideoQuality) {
         currentVideoQuality = quality
         evaluateWebcamTopologyTransition()
@@ -3279,7 +3332,18 @@ internal class WebRTCClient : SendTransport.Listener, RecvTransport.Listener, Pr
     }
 
     internal fun applyLocalBandwidthProfile(connectionQuality: ConnectionQuality) {
-        val signature = "${currentVideoQuality}:${connectionQuality}"
+        val signature = listOf(
+            currentVideoQuality,
+            connectionQuality,
+            "${configuredCameraWidth}x${configuredCameraHeight}@${configuredCameraFrameRate}",
+            configuredCameraMaxBitrateBps,
+            configuredCameraContentHint,
+            configuredCameraDegradationPreference,
+            "${configuredScreenMaxWidth}x${configuredScreenMaxHeight}@${configuredScreenFrameRate}",
+            configuredScreenMaxBitrateBps,
+            configuredScreenContentHint,
+            configuredScreenDegradationPreference,
+        ).joinToString(":")
         if (lastAppliedLocalBandwidthSignature == signature) return
         currentLocalBandwidthQuality = connectionQuality
         lastAppliedLocalBandwidthSignature = signature
@@ -3467,6 +3531,7 @@ internal class WebRTCClient : SendTransport.Listener, RecvTransport.Listener, Pr
             nextProducer.resume()
             screenProducer = nextProducer
             screenProducerBandwidthQuality = connectionQuality
+            screenProducerBandwidthSignature = localScreenBandwidthSignature(connectionQuality)
             val metrics = ProcessInfo.processInfo.androidContext.resources.displayMetrics
             val capture = screenShareCaptureProfile(
                 metrics.widthPixels,
@@ -3511,14 +3576,28 @@ internal class WebRTCClient : SendTransport.Listener, RecvTransport.Listener, Pr
     private fun localVideoBandwidthSignature(
         quality: VideoQuality,
         connectionQuality: ConnectionQuality,
-    ): String = "${quality}:${connectionQuality}"
+    ): String = listOf(
+        quality,
+        connectionQuality,
+        "${configuredCameraWidth}x${configuredCameraHeight}@${configuredCameraFrameRate}",
+        configuredCameraMaxBitrateBps,
+        configuredCameraContentHint,
+        configuredCameraDegradationPreference,
+    ).joinToString(":")
+
+    private fun localScreenBandwidthSignature(
+        connectionQuality: ConnectionQuality,
+    ): String = listOf(
+        connectionQuality,
+        "${configuredScreenMaxWidth}x${configuredScreenMaxHeight}@${configuredScreenFrameRate}",
+        configuredScreenMaxBitrateBps,
+        configuredScreenContentHint,
+        configuredScreenDegradationPreference,
+    ).joinToString(":")
 
     private fun shouldRefreshVideoProducerForBandwidthProfile(
         connectionQuality: ConnectionQuality,
     ): Boolean {
-        if (connectionQuality == ConnectionQuality.unknown) {
-            return false
-        }
         if (videoProducer == null || !localVideoEnabled || localVideoTrack?.enabled() != true) {
             return false
         }
@@ -3530,13 +3609,10 @@ internal class WebRTCClient : SendTransport.Listener, RecvTransport.Listener, Pr
     private fun shouldRefreshScreenProducerForBandwidthProfile(
         connectionQuality: ConnectionQuality,
     ): Boolean {
-        if (connectionQuality == ConnectionQuality.unknown) {
-            return false
-        }
         if (screenProducer == null || screenVideoTrack == null || screenCapturer == null) {
             return false
         }
-        return connectionQuality != screenProducerBandwidthQuality
+        return screenProducerBandwidthSignature != localScreenBandwidthSignature(connectionQuality)
     }
 
     private fun connectionQualityRank(quality: ConnectionQuality): Int {
@@ -3553,33 +3629,83 @@ internal class WebRTCClient : SendTransport.Listener, RecvTransport.Listener, Pr
         quality: VideoQuality,
         connectionQuality: ConnectionQuality = ConnectionQuality.unknown,
     ): WebcamCaptureProfile {
+        val configured = WebcamCaptureProfile(
+            width = configuredCameraWidth,
+            height = configuredCameraHeight,
+            fps = configuredCameraFrameRate,
+        )
         if (connectionQuality == ConnectionQuality.emergency) {
-            return WebcamCaptureProfile(width = 640, height = 360, fps = 8)
+            return constrainedWebcamCaptureProfile(configured, 640, 360, 8)
         }
         if (connectionQuality == ConnectionQuality.poor) {
-            return WebcamCaptureProfile(width = 640, height = 360, fps = 12)
+            return constrainedWebcamCaptureProfile(configured, 640, 360, 12)
         }
-        if (connectionQuality == ConnectionQuality.fair || quality == VideoQuality.low) {
-            return WebcamCaptureProfile(width = 640, height = 360, fps = 20)
+        if (connectionQuality == ConnectionQuality.fair) {
+            return constrainedWebcamCaptureProfile(configured, 640, 360, 20)
         }
+        if (quality == VideoQuality.low) {
+            return constrainedWebcamCaptureProfile(configured, 640, 360, 20)
+        }
+        return configured
+    }
 
-        return when (quality) {
-            VideoQuality.low -> WebcamCaptureProfile(width = 640, height = 360, fps = 20)
-            VideoQuality.standard -> WebcamCaptureProfile(width = 1280, height = 720, fps = 30)
-        }
+    private fun constrainedWebcamCaptureProfile(
+        configured: WebcamCaptureProfile,
+        maxWidth: Int,
+        maxHeight: Int,
+        maxFrameRate: Int,
+    ): WebcamCaptureProfile {
+        return WebcamCaptureProfile(
+            width = minOf(configured.width, maxWidth),
+            height = minOf(configured.height, maxHeight),
+            fps = minOf(configured.fps, maxFrameRate),
+        )
     }
 
     private fun webcamEncodingSpecs(quality: VideoQuality): List<WebcamEncodingSpec> {
-        return when (quality) {
-            VideoQuality.low -> listOf(
+        val defaults: List<WebcamEncodingSpec>
+        val defaultMaximumBitrate: Int
+        when (quality) {
+            VideoQuality.low -> {
+                defaults = listOf(
                 WebcamEncodingSpec(rid = "q", scaleResolutionDownBy = 2.0, maxBitrateBps = 65_000, maxFramerate = 8),
                 WebcamEncodingSpec(rid = "h", scaleResolutionDownBy = 1.0, maxBitrateBps = 120_000, maxFramerate = 12),
                 WebcamEncodingSpec(rid = "f", scaleResolutionDownBy = 1.0, maxBitrateBps = 180_000, maxFramerate = 15),
-            )
-            VideoQuality.standard -> listOf(
+                )
+                defaultMaximumBitrate = 180_000
+            }
+            VideoQuality.standard -> {
+                defaults = listOf(
                 WebcamEncodingSpec(rid = "q", scaleResolutionDownBy = 4.0, maxBitrateBps = 80_000, maxFramerate = 12),
                 WebcamEncodingSpec(rid = "h", scaleResolutionDownBy = 2.0, maxBitrateBps = 220_000, maxFramerate = 20),
                 WebcamEncodingSpec(rid = "f", scaleResolutionDownBy = 1.0, maxBitrateBps = 1_650_000, maxFramerate = 30),
+                )
+                defaultMaximumBitrate = 1_650_000
+            }
+        }
+
+        val lastIndex = defaults.lastIndex
+        val effectiveMaximumBitrate = if (quality == VideoQuality.low) {
+            minOf(configuredCameraMaxBitrateBps, defaultMaximumBitrate)
+        } else {
+            configuredCameraMaxBitrateBps
+        }
+        return defaults.mapIndexed { index, spec ->
+            val bitrateRatio = spec.maxBitrateBps.toDouble() / defaultMaximumBitrate.toDouble()
+            val detailLayerFactor =
+                if (configuredCameraContentHint == "detail" && index < lastIndex) 0.75 else 1.0
+            WebcamEncodingSpec(
+                rid = spec.rid,
+                scaleResolutionDownBy = spec.scaleResolutionDownBy,
+                maxBitrateBps = maxOf(
+                    20_000,
+                    (effectiveMaximumBitrate.toDouble() * bitrateRatio * detailLayerFactor).toInt(),
+                ),
+                maxFramerate = if (index == lastIndex) {
+                    configuredCameraFrameRate
+                } else {
+                    minOf(spec.maxFramerate, configuredCameraFrameRate)
+                },
             )
         }
     }
@@ -3654,8 +3780,8 @@ internal class WebRTCClient : SendTransport.Listener, RecvTransport.Listener, Pr
     private fun webcamSingleReceiverEncodings(): List<RtpParameters.Encoding> {
         return listOf(
             RtpParameters.Encoding(null, true, 1.0).also { encoding ->
-                encoding.maxBitrateBps = 1_650_000
-                encoding.maxFramerate = 30
+                encoding.maxBitrateBps = configuredCameraMaxBitrateBps
+                encoding.maxFramerate = configuredCameraFrameRate
                 encoding.numTemporalLayers = WebcamTemporalLayerPolicy.temporalLayerCount
                 encoding.networkPriority = WEBRTC_NETWORK_PRIORITY_LOW
             },
@@ -3684,7 +3810,7 @@ internal class WebRTCClient : SendTransport.Listener, RecvTransport.Listener, Pr
     }
 
     private fun restoredAdaptiveWebcamEncodings(): List<RtpParameters.Encoding> {
-        return webcamEncodings(VideoQuality.standard, ConnectionQuality.good)
+        return webcamEncodings(currentVideoQuality, ConnectionQuality.good)
     }
 
     private fun webcamMaxSpatialLayer(
@@ -3722,28 +3848,28 @@ internal class WebRTCClient : SendTransport.Listener, RecvTransport.Listener, Pr
     ): ScreenShareEncodingCap {
         return when (connectionQuality) {
             ConnectionQuality.emergency -> ScreenShareEncodingCap(
-                maxBitrateBps = 220_000,
-                maxFramerate = 3,
-                maxWidth = 1280,
-                maxHeight = 720,
+                maxBitrateBps = minOf(configuredScreenMaxBitrateBps, 220_000),
+                maxFramerate = minOf(configuredScreenFrameRate, 3),
+                maxWidth = minOf(configuredScreenMaxWidth, 1280),
+                maxHeight = minOf(configuredScreenMaxHeight, 720),
             )
             ConnectionQuality.poor -> ScreenShareEncodingCap(
-                maxBitrateBps = 450_000,
-                maxFramerate = 5,
-                maxWidth = 1920,
-                maxHeight = 1080,
+                maxBitrateBps = minOf(configuredScreenMaxBitrateBps, 450_000),
+                maxFramerate = minOf(configuredScreenFrameRate, 5),
+                maxWidth = minOf(configuredScreenMaxWidth, 1920),
+                maxHeight = minOf(configuredScreenMaxHeight, 1080),
             )
             ConnectionQuality.fair -> ScreenShareEncodingCap(
-                maxBitrateBps = 1_200_000,
-                maxFramerate = 12,
-                maxWidth = 2560,
-                maxHeight = 1440,
+                maxBitrateBps = minOf(configuredScreenMaxBitrateBps, 1_200_000),
+                maxFramerate = minOf(configuredScreenFrameRate, 12),
+                maxWidth = minOf(configuredScreenMaxWidth, 2560),
+                maxHeight = minOf(configuredScreenMaxHeight, 1440),
             )
             ConnectionQuality.good, ConnectionQuality.unknown -> ScreenShareEncodingCap(
-                maxBitrateBps = 2_500_000,
-                maxFramerate = 24,
-                maxWidth = 3840,
-                maxHeight = 2160,
+                maxBitrateBps = configuredScreenMaxBitrateBps,
+                maxFramerate = configuredScreenFrameRate,
+                maxWidth = configuredScreenMaxWidth,
+                maxHeight = configuredScreenMaxHeight,
             )
         }
     }
@@ -4282,6 +4408,7 @@ internal class WebRTCClient : SendTransport.Listener, RecvTransport.Listener, Pr
         videoProducerBandwidthQuality = ConnectionQuality.unknown
         videoProducerBandwidthSignature = null
         screenProducerBandwidthQuality = ConnectionQuality.unknown
+        screenProducerBandwidthSignature = null
         audioBandwidthRefreshInFlight = false
         audioProducerRouteRecoveryInFlight = false
         videoBandwidthRefreshInFlight = false

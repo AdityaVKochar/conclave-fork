@@ -35,6 +35,35 @@ enum ScreenCaptureStartPolicy {
     }
 }
 
+enum ScreenShareBroadcastLifecycleState: String {
+    case idle
+    case starting
+    case active
+    case reconnecting
+    case stopped
+}
+
+enum ScreenShareLifecycleBusKeys {
+    static let state = "conclave.screenShare.lifecycle.state"
+    static let updatedAt = "conclave.screenShare.lifecycle.updatedAt"
+    static let stopRequestedAt = "conclave.screenShare.lifecycle.stopRequestedAt"
+}
+
+enum ScreenCaptureReconnectPolicy {
+    // The extension retries for six seconds. Leave enough room for scheduling
+    // jitter when the main app transitions between foreground and background.
+    static let graceNanoseconds = UInt64(8_000_000_000)
+
+    static func shouldFinalizeDisconnect(
+        generation: Int,
+        currentGeneration: Int,
+        hasServer: Bool,
+        isConnected: Bool
+    ) -> Bool {
+        generation == currentGeneration && hasServer && !isConnected
+    }
+}
+
 #if canImport(UIKit) && !SKIP
 
 private final class ScreenShareFrameRateGate: @unchecked Sendable {
@@ -73,6 +102,70 @@ private final class ScreenShareFrameRateGate: @unchecked Sendable {
     }
 }
 
+/// Coalesces ReplayKit frames before they cross onto the main queue. JPEG
+/// decoding can outpace both the MainActor and WebRTC's encoder, especially
+/// for portrait device frames. Keeping only the newest pending frame prevents
+/// an unbounded queue of retained pixel buffers while preserving the freshest
+/// screen contents.
+private final class ScreenShareLatestFramePump: @unchecked Sendable {
+    typealias Delivery = @MainActor @Sendable (ScreenFrameBox) -> Void
+
+    private let lock = NSLock()
+    private var pendingFrame: ScreenFrameBox?
+    private var deliveryScheduled = false
+
+    func enqueue(_ frame: ScreenFrameBox, delivery: @escaping Delivery) {
+        lock.lock()
+        pendingFrame = frame
+        let shouldSchedule = !deliveryScheduled
+        if shouldSchedule {
+            deliveryScheduled = true
+        }
+        lock.unlock()
+
+        if shouldSchedule {
+            scheduleDrain(delivery: delivery)
+        }
+    }
+
+    func reset() {
+        lock.lock()
+        pendingFrame = nil
+        lock.unlock()
+    }
+
+    private func scheduleDrain(delivery: @escaping Delivery) {
+        DispatchQueue.main.async { [weak self] in
+            self?.drain(delivery: delivery)
+        }
+    }
+
+    @MainActor
+    private func drain(delivery: @escaping Delivery) {
+        lock.lock()
+        guard let frame = pendingFrame else {
+            deliveryScheduled = false
+            lock.unlock()
+            return
+        }
+        pendingFrame = nil
+        lock.unlock()
+
+        delivery(frame)
+
+        lock.lock()
+        let shouldContinue = pendingFrame != nil
+        if !shouldContinue {
+            deliveryScheduled = false
+        }
+        lock.unlock()
+
+        if shouldContinue {
+            scheduleDrain(delivery: delivery)
+        }
+    }
+}
+
 /// Manages screen capture coordination between the broadcast extension and WebRTC.
 @MainActor
 final class ScreenCaptureManager: NSObject {
@@ -81,6 +174,11 @@ final class ScreenCaptureManager: NSObject {
     // MARK: - Configuration
     private let appGroupIdentifier = "group.com.acmvit.conclave.screenshare"
     private let broadcastExtensionBundleId = "com.acmvit.conclave.ScreenShareExtension"
+    private let publishFrameRateKey = "conclave.screenShare.maxFrameRate"
+    private let publishMaxWidthKey = "conclave.screenShare.maxWidth"
+    private let publishMaxHeightKey = "conclave.screenShare.maxHeight"
+    private let publishMaxBitrateKey = "conclave.screenShare.maxBitrateBps"
+    private let publishContentHintKey = "conclave.screenShare.contentHint"
 
     // MARK: - Publishers
     let isCapturing = CurrentValueSubject<Bool, Never>(false)
@@ -95,19 +193,57 @@ final class ScreenCaptureManager: NSObject {
     private weak var webRTCClient: WebRTCClient?
     private var server: ScreenShareSocketServer?
     private var connected = false
+    private var hasConnectedInCurrentCapture = false
     private var startGeneration = 0
     private var pendingStartContinuation: CheckedContinuation<Void, Error>?
     private var startTimeoutTask: Task<Void, Never>?
+    private var reconnectGraceTask: Task<Void, Never>?
     private let frameGate = ScreenShareFrameRateGate()
+    private let framePump = ScreenShareLatestFramePump()
+    private var publishMaxFrameRate = 24.0
+    private var publishMaxWidth = 3_840
+    private var publishMaxHeight = 2_160
+    private var publishMaxBitrateBps = 2_500_000
+    private var publishContentHint = NativeScreenShareContentHint.detail.rawValue
 
     // MARK: - Public Methods
 
     var isCaptureActive: Bool {
-        server != nil && connected
+        server != nil && (connected || reconnectGraceTask != nil)
     }
 
     func updateMaxFrameRate(_ maxFrameRate: Double) {
-        frameGate.update(maxFrameRate: maxFrameRate)
+        updatePublishProfile(
+            maxFrameRate: maxFrameRate,
+            maxWidth: publishMaxWidth,
+            maxHeight: publishMaxHeight,
+            maxBitrateBps: publishMaxBitrateBps,
+            contentHint: publishContentHint
+        )
+    }
+
+    func updatePublishProfile(
+        maxFrameRate: Double,
+        maxWidth: Int,
+        maxHeight: Int,
+        maxBitrateBps: Int,
+        contentHint: String
+    ) {
+        publishMaxFrameRate = max(1.0, min(maxFrameRate, 60.0))
+        publishMaxWidth = max(320, min(maxWidth, 3_840))
+        publishMaxHeight = max(180, min(maxHeight, 2_160))
+        publishMaxBitrateBps = max(150_000, min(maxBitrateBps, 15_000_000))
+        publishContentHint = contentHint
+        frameGate.update(maxFrameRate: publishMaxFrameRate)
+        server?.updateMaxResolution(width: publishMaxWidth, height: publishMaxHeight)
+
+        if let defaults = UserDefaults(suiteName: appGroupIdentifier) {
+            defaults.set(publishMaxFrameRate, forKey: publishFrameRateKey)
+            defaults.set(publishMaxWidth, forKey: publishMaxWidthKey)
+            defaults.set(publishMaxHeight, forKey: publishMaxHeightKey)
+            defaults.set(publishMaxBitrateBps, forKey: publishMaxBitrateKey)
+            defaults.set(publishContentHint, forKey: publishContentHintKey)
+        }
     }
 
     /// Stand up the socket server and present the system broadcast picker. The
@@ -120,24 +256,30 @@ final class ScreenCaptureManager: NSObject {
             await stopCapture()
         }
 
+        framePump.reset()
         self.webRTCClient = webRTCClient
         self.connected = false
-        frameGate.update(maxFrameRate: webRTCClient.screenShareCaptureMaxFramerate)
+        self.hasConnectedInCurrentCapture = false
+        updatePublishProfile(
+            maxFrameRate: webRTCClient.screenShareCaptureMaxFramerate,
+            maxWidth: webRTCClient.screenShareCaptureMaxWidth,
+            maxHeight: webRTCClient.screenShareCaptureMaxHeight,
+            maxBitrateBps: publishMaxBitrateBps,
+            contentHint: publishContentHint
+        )
         startGeneration &+= 1
         let generation = startGeneration
 
         guard let server = ScreenShareSocketServer(appGroupIdentifier: appGroupIdentifier) else {
             throw ScreenCaptureError.appGroupUnavailable
         }
+        server.updateMaxResolution(width: publishMaxWidth, height: publishMaxHeight)
 
         let started = server.start(
             onFrame: { [weak self] box in
-                // Hop to the main actor (WebRTCClient is @MainActor-isolated)
-                // via DispatchQueue.main.async - it preserves FIFO order across
-                // the hop, unlike unstructured Tasks which can reorder frames.
-                DispatchQueue.main.async { [weak self] in
+                self?.framePump.enqueue(box) { [weak self] latestFrame in
                     guard self?.startGeneration == generation else { return }
-                    self?.webRTCClient?.feedScreenFrame(box.frame)
+                    self?.webRTCClient?.feedScreenFrame(latestFrame.frame)
                 }
             },
             shouldDecodeFrame: { [frameGate] in
@@ -148,7 +290,10 @@ final class ScreenCaptureManager: NSObject {
                     guard let self else { return }
                     guard self.startGeneration == generation,
                           self.server != nil else { return }
+                    self.reconnectGraceTask?.cancel()
+                    self.reconnectGraceTask = nil
                     self.connected = true
+                    self.hasConnectedInCurrentCapture = true
                     self.isCapturing.send(true)
                     self.finishPendingStart(.success(()))
                 }
@@ -156,7 +301,7 @@ final class ScreenCaptureManager: NSObject {
             onDisconnect: { [weak self] in
                 DispatchQueue.main.async { [weak self] in
                     guard self?.startGeneration == generation else { return }
-                    self?.handleExternalStop()
+                    self?.scheduleReconnectGrace(generation: generation)
                 }
             }
         )
@@ -195,11 +340,16 @@ final class ScreenCaptureManager: NSObject {
     /// makes the extension's next write fail, which finishes the broadcast
     /// gracefully.
     func stopCapture() async {
+        requestBroadcastStop()
         startGeneration &+= 1
         startTimeoutTask?.cancel()
         startTimeoutTask = nil
+        reconnectGraceTask?.cancel()
+        reconnectGraceTask = nil
         connected = false
+        hasConnectedInCurrentCapture = false
         frameGate.reset()
+        framePump.reset()
         server?.stop()
         server = nil
         webRTCClient = nil
@@ -207,22 +357,44 @@ final class ScreenCaptureManager: NSObject {
         finishPendingStart(.failure(ScreenCaptureError.cancelled))
     }
 
+    /// Reconcile the app's in-memory state with the extension-owned lifecycle
+    /// record whenever iOS moves the app between foreground and background.
+    /// Socket callbacks remain authoritative while connected; the shared record
+    /// covers extension termination while the app was suspended.
+    func reconcileBroadcastLifecycle() {
+        guard server != nil, pendingStartContinuation == nil else { return }
+        switch persistedBroadcastState {
+        case .idle, .stopped:
+            handleExternalStop()
+        case .starting, .active, .reconnecting:
+            if connected {
+                isCapturing.send(true)
+            } else if reconnectGraceTask == nil {
+                scheduleReconnectGrace(generation: startGeneration)
+            }
+        }
+    }
+
     // MARK: - Private
 
     private func handleExternalStop() {
         guard server != nil else { return }
-        let wasConnected = connected
+        let hadConnected = hasConnectedInCurrentCapture
         startGeneration &+= 1
         startTimeoutTask?.cancel()
         startTimeoutTask = nil
+        reconnectGraceTask?.cancel()
+        reconnectGraceTask = nil
         connected = false
+        hasConnectedInCurrentCapture = false
         frameGate.reset()
+        framePump.reset()
         server?.stop()
         server = nil
         webRTCClient = nil
         isCapturing.send(false)
         finishPendingStart(.failure(ScreenCaptureError.cancelled))
-        if wasConnected {
+        if hadConnected {
             onBroadcastStopped?()
         }
     }
@@ -233,8 +405,12 @@ final class ScreenCaptureManager: NSObject {
         startGeneration &+= 1
         startTimeoutTask?.cancel()
         startTimeoutTask = nil
+        reconnectGraceTask?.cancel()
+        reconnectGraceTask = nil
         connected = false
+        hasConnectedInCurrentCapture = false
         frameGate.reset()
+        framePump.reset()
         server?.stop()
         server = nil
         webRTCClient = nil
@@ -271,6 +447,53 @@ final class ScreenCaptureManager: NSObject {
                   ) else { return }
             self.handleExternalStop()
         }
+    }
+
+    private func scheduleReconnectGrace(generation: Int) {
+        guard startGeneration == generation, server != nil else { return }
+        connected = false
+        reconnectGraceTask?.cancel()
+        reconnectGraceTask = Task { @MainActor [weak self] in
+            let pollInterval = UInt64(250_000_000)
+            let pollCount = Int(ScreenCaptureReconnectPolicy.graceNanoseconds / pollInterval)
+            for _ in 0..<pollCount {
+                try? await Task.sleep(nanoseconds: pollInterval)
+                guard !Task.isCancelled, let self else { return }
+                if self.persistedBroadcastState == .stopped {
+                    self.reconnectGraceTask = nil
+                    self.handleExternalStop()
+                    return
+                }
+                if self.connected { return }
+            }
+            guard !Task.isCancelled,
+                  let self,
+                  ScreenCaptureReconnectPolicy.shouldFinalizeDisconnect(
+                    generation: generation,
+                    currentGeneration: self.startGeneration,
+                    hasServer: self.server != nil,
+                    isConnected: self.connected
+                  ) else { return }
+            self.reconnectGraceTask = nil
+            self.handleExternalStop()
+        }
+    }
+
+    private var persistedBroadcastState: ScreenShareBroadcastLifecycleState {
+        guard let rawValue = UserDefaults(suiteName: appGroupIdentifier)?
+            .string(forKey: ScreenShareLifecycleBusKeys.state),
+              let state = ScreenShareBroadcastLifecycleState(rawValue: rawValue) else {
+            return .idle
+        }
+        return state
+    }
+
+    private func requestBroadcastStop() {
+        guard server != nil else { return }
+        UserDefaults(suiteName: appGroupIdentifier)?.set(
+            Date().timeIntervalSince1970,
+            forKey: ScreenShareLifecycleBusKeys.stopRequestedAt
+        )
     }
 
     private func presentBroadcastPicker() {

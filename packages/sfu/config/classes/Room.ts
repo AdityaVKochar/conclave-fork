@@ -18,10 +18,15 @@ import * as Y from "yjs";
 import type {
   ActiveSpeakerChangedNotification,
   ChatMessage,
+  ChatMessageReaction,
   ProducerInfo,
   VideoQuality,
+  WebinarHandQueueEntry,
+  WebinarQaEntry,
+  WebinarQaStatus,
   WebRtcTransportRole,
 } from "../../types.js";
+import { MAX_REACTIONS_PER_CHAT_MESSAGE } from "../../types.js";
 import { Logger } from "../../utilities/loggers.js";
 import { config } from "../config.js";
 import { Admin } from "./Admin.js";
@@ -91,7 +96,33 @@ export type RoomChatImageAsset = {
 
 const WEBINAR_AUDIO_LEVEL_THRESHOLD = -70;
 const WEBINAR_AUDIO_LEVEL_INTERVAL_MS = 350;
+const MAX_WEBINAR_QA_ENTRIES = 300;
+const MAX_WEBINAR_OPEN_QUESTIONS_PER_USER = 3;
+export const MAX_WEBINAR_QA_QUESTION_LENGTH = 500;
+export const MAX_WEBINAR_QA_ANSWER_LENGTH = 1000;
+const MAX_WEBINAR_PROMOTED_USER_KEYS = 200;
+// A stage invite should cover one webinar (plus reconnects), not become a
+// permanent skeleton key for this identity.
+const WEBINAR_PROMOTION_TTL_MS = 4 * 60 * 60 * 1000;
+
+type WebinarQaEntryState = {
+  id: string;
+  userId: string;
+  displayName: string;
+  question: string;
+  status: WebinarQaStatus;
+  askedAt: number;
+  updatedAt: number;
+  upvoterUserIds: Set<string>;
+  answerText?: string;
+  answeredByName?: string;
+};
 const CHAT_HISTORY_LIMIT = 100;
+
+export type ToggleChatReactionResult =
+  | { ok: true; reactions: ChatMessageReaction[] }
+  | { ok: false; reason: "not-found" | "too-many-reactions" };
+
 export const MAX_CHAT_IMAGE_BYTES = 6 * 1024 * 1024;
 export const CHAT_IMAGE_ORPHAN_TTL_MS = 2 * 60 * 1000;
 const MAX_CHAT_IMAGE_ROOM_BYTES = 64 * 1024 * 1024;
@@ -222,6 +253,24 @@ export class Room {
   private webinarWebcamAudioProducerOwners: Map<string, string> = new Map();
   private webinarFeedRefreshNotifier: ((room: Room) => void) | null = null;
   private webinarAttendeeCount = 0;
+  /** Attendee raised hands (webinar stage requests), userId → raisedAt. */
+  private webinarRaisedHandAt: Map<string, number> = new Map();
+  /** Q&A entries in insertion order, id → entry. */
+  private webinarQaEntries: Map<string, WebinarQaEntryState> = new Map();
+  private webinarQaSequence = 0;
+  /**
+   * Identities the host invited on stage (userKey → invite expiry). Checked
+   * during rejoin so a promoted attendee can pass the participant-side join
+   * gates (webinar room guard, lock, waiting room, invite code, guest policy)
+   * without host re-approval.
+   */
+  private webinarPromotedUserKeys: Map<string, number> = new Map();
+  /**
+   * Identities the host moved back to the audience. While webinar mode is on,
+   * these may not re-enter as participants — a demoted client that ignores
+   * the demote signal cannot simply rejoin the panel.
+   */
+  private webinarDemotedUserKeys: Set<string> = new Set();
   private meetingParticipantCount = 0;
   private currentWebcamCodecPolicy: WebcamCodecPolicy =
     buildWebcamCodecPolicy("vp8", 0);
@@ -689,6 +738,7 @@ export class Room {
     const departingUserKey = this.userKeysById.get(clientId);
     this.userKeysById.delete(clientId);
     this.handRaisedByUserId.delete(clientId);
+    this.webinarRaisedHandAt.delete(clientId);
     // Drop the cached display name once NO live client still shares this userKey
     // (a user may be joined from two tabs under one key). Without this,
     // displayNamesByKey is only cleared on full room teardown, so a long-lived
@@ -733,6 +783,226 @@ export class Room {
     return snapshot;
   }
 
+  // ── Webinar attendee interaction (hands, Q&A, stage invites) ──────────
+
+  setWebinarHandRaised(userId: string, raised: boolean): boolean {
+    if (raised) {
+      if (this.webinarRaisedHandAt.has(userId)) return false;
+      this.webinarRaisedHandAt.set(userId, Date.now());
+      return true;
+    }
+    return this.webinarRaisedHandAt.delete(userId);
+  }
+
+  getWebinarHandQueue(): WebinarHandQueueEntry[] {
+    const queue: WebinarHandQueueEntry[] = [];
+    for (const [userId, raisedAt] of this.webinarRaisedHandAt) {
+      const client = this.clients.get(userId);
+      if (!client || !client.isWebinarAttendee) continue;
+      queue.push({
+        userId,
+        displayName: this.getDisplayNameForUser(userId) || userId,
+        raisedAt,
+      });
+    }
+    queue.sort((a, b) => a.raisedAt - b.raisedAt);
+    return queue;
+  }
+
+  submitWebinarQuestion(
+    userId: string,
+    displayName: string,
+    question: string,
+  ): { entry: WebinarQaEntry; evictedIds: string[] } | { error: string } {
+    let openForUser = 0;
+    for (const state of this.webinarQaEntries.values()) {
+      if (
+        state.userId === userId &&
+        (state.status === "pending" || state.status === "answering")
+      ) {
+        openForUser += 1;
+      }
+    }
+    if (openForUser >= MAX_WEBINAR_OPEN_QUESTIONS_PER_USER) {
+      return {
+        error: "You already have questions waiting. Give the host a moment.",
+      };
+    }
+
+    this.webinarQaSequence += 1;
+    const now = Date.now();
+    const state: WebinarQaEntryState = {
+      id: `q${this.webinarQaSequence}-${now.toString(36)}`,
+      userId,
+      displayName,
+      question,
+      status: "pending",
+      askedAt: now,
+      updatedAt: now,
+      upvoterUserIds: new Set<string>(),
+    };
+    this.webinarQaEntries.set(state.id, state);
+    const evictedIds = this.evictWebinarQaOverflow();
+    return { entry: this.projectWebinarQaEntry(state, userId), evictedIds };
+  }
+
+  toggleWebinarQuestionUpvote(
+    userId: string,
+    questionId: string,
+  ): WebinarQaEntryState | null {
+    const state = this.webinarQaEntries.get(questionId);
+    if (!state || state.status === "dismissed") return null;
+    if (!state.upvoterUserIds.delete(userId)) {
+      state.upvoterUserIds.add(userId);
+    }
+    state.updatedAt = Date.now();
+    return state;
+  }
+
+  moderateWebinarQuestion(
+    questionId: string,
+    action: "answering" | "answered" | "dismissed" | "reopen",
+    options?: { answerText?: string; moderatorName?: string },
+  ): WebinarQaEntryState | null {
+    const state = this.webinarQaEntries.get(questionId);
+    if (!state) return null;
+
+    switch (action) {
+      case "answering":
+        state.status = "answering";
+        state.answeredByName = options?.moderatorName ?? state.answeredByName;
+        break;
+      case "answered":
+        state.status = "answered";
+        state.answeredByName = options?.moderatorName ?? state.answeredByName;
+        if (options?.answerText !== undefined) {
+          state.answerText = options.answerText || undefined;
+        }
+        break;
+      case "dismissed":
+        state.status = "dismissed";
+        break;
+      case "reopen":
+        state.status = "pending";
+        break;
+    }
+    state.updatedAt = Date.now();
+    return state;
+  }
+
+  getWebinarQaEntryState(questionId: string): WebinarQaEntryState | null {
+    return this.webinarQaEntries.get(questionId) ?? null;
+  }
+
+  projectWebinarQaEntry(
+    state: WebinarQaEntryState,
+    viewerUserId?: string,
+  ): WebinarQaEntry {
+    return {
+      id: state.id,
+      userId: state.userId,
+      displayName: state.displayName,
+      question: state.question,
+      status: state.status,
+      askedAt: state.askedAt,
+      updatedAt: state.updatedAt,
+      upvotes: state.upvoterUserIds.size,
+      ...(viewerUserId
+        ? { hasUpvoted: state.upvoterUserIds.has(viewerUserId) }
+        : {}),
+      ...(state.answerText ? { answerText: state.answerText } : {}),
+      ...(state.answeredByName ? { answeredByName: state.answeredByName } : {}),
+    };
+  }
+
+  /** Attendees see their own questions plus everything the host surfaced. */
+  isWebinarQaEntryVisibleTo(
+    state: WebinarQaEntryState,
+    viewerUserId: string,
+    isModerator: boolean,
+  ): boolean {
+    if (isModerator) return true;
+    if (state.userId === viewerUserId) return true;
+    return state.status === "answering" || state.status === "answered";
+  }
+
+  getWebinarQaSnapshotFor(
+    viewerUserId: string,
+    isModerator: boolean,
+  ): WebinarQaEntry[] {
+    const entries: WebinarQaEntry[] = [];
+    for (const state of this.webinarQaEntries.values()) {
+      if (!this.isWebinarQaEntryVisibleTo(state, viewerUserId, isModerator)) {
+        continue;
+      }
+      entries.push(this.projectWebinarQaEntry(state, viewerUserId));
+    }
+    return entries;
+  }
+
+  /** Trims the store to its cap; returns the ids removed so callers can
+   * broadcast the removals (silent eviction leaves ghost rows on clients). */
+  private evictWebinarQaOverflow(): string[] {
+    const evictedIds: string[] = [];
+    if (this.webinarQaEntries.size <= MAX_WEBINAR_QA_ENTRIES) return evictedIds;
+    const byPriority: WebinarQaStatus[] = ["dismissed", "answered", "pending"];
+    for (const status of byPriority) {
+      for (const [id, state] of this.webinarQaEntries) {
+        if (this.webinarQaEntries.size <= MAX_WEBINAR_QA_ENTRIES) {
+          return evictedIds;
+        }
+        if (state.status === status) {
+          this.webinarQaEntries.delete(id);
+          evictedIds.push(id);
+        }
+      }
+    }
+    for (const id of this.webinarQaEntries.keys()) {
+      if (this.webinarQaEntries.size <= MAX_WEBINAR_QA_ENTRIES) {
+        return evictedIds;
+      }
+      this.webinarQaEntries.delete(id);
+      evictedIds.push(id);
+    }
+    return evictedIds;
+  }
+
+  promoteWebinarUserKey(userKey: string): void {
+    if (this.webinarPromotedUserKeys.size >= MAX_WEBINAR_PROMOTED_USER_KEYS) {
+      const oldest = this.webinarPromotedUserKeys.keys().next().value;
+      if (oldest !== undefined) {
+        this.webinarPromotedUserKeys.delete(oldest);
+      }
+    }
+    this.webinarPromotedUserKeys.set(
+      userKey,
+      Date.now() + WEBINAR_PROMOTION_TTL_MS,
+    );
+    this.webinarDemotedUserKeys.delete(userKey);
+  }
+
+  revokeWebinarPromotion(userKey: string): boolean {
+    return this.webinarPromotedUserKeys.delete(userKey);
+  }
+
+  isWebinarPromotedUserKey(userKey: string): boolean {
+    const expiresAt = this.webinarPromotedUserKeys.get(userKey);
+    if (expiresAt === undefined) return false;
+    if (expiresAt <= Date.now()) {
+      this.webinarPromotedUserKeys.delete(userKey);
+      return false;
+    }
+    return true;
+  }
+
+  markWebinarDemotedUserKey(userKey: string): void {
+    this.webinarDemotedUserKeys.add(userKey);
+  }
+
+  isWebinarDemotedUserKey(userKey: string): boolean {
+    return this.webinarDemotedUserKeys.has(userKey);
+  }
+
   // Retain the most recent broadcast (non-DM) chat messages so a late-joining
   // or refreshing client can be seeded with prior conversation. Direct messages
   // are intentionally excluded: they are only ever delivered to the sender and
@@ -752,6 +1022,50 @@ export class Room {
 
   getChatHistorySnapshot(): ChatMessage[] {
     return this.recentChatMessages.slice();
+  }
+
+  /**
+   * Toggle `userId`'s `emoji` reaction on a retained chat message.
+   *
+   * Reactions are stored on the retained message itself, so they replay to late
+   * joiners via getChatHistorySnapshot() and are evicted with the message. Only
+   * broadcast messages are retained (see recordChatMessage), so direct messages
+   * cannot be reacted to — the handler surfaces that as "Message not found".
+   */
+  toggleChatMessageReaction(
+    messageId: string,
+    userId: string,
+    emoji: string,
+  ): ToggleChatReactionResult {
+    const message = this.recentChatMessages.find((m) => m.id === messageId);
+    if (!message) {
+      return { ok: false, reason: "not-found" };
+    }
+
+    const reactions = message.reactions ?? [];
+    const existing = reactions.find((r) => r.emoji === emoji);
+
+    if (existing) {
+      const index = existing.userIds.indexOf(userId);
+      if (index === -1) {
+        existing.userIds.push(userId);
+      } else {
+        existing.userIds.splice(index, 1);
+      }
+    } else {
+      // Only adding a *new* emoji can grow the set, so this is the only place
+      // the cap needs enforcing. Removals below can shrink it again.
+      if (reactions.length >= MAX_REACTIONS_PER_CHAT_MESSAGE) {
+        return { ok: false, reason: "too-many-reactions" };
+      }
+      reactions.push({ emoji, userIds: [userId] });
+    }
+
+    // Drop emoji nobody is reacting with so counts never render as zero.
+    const remaining = reactions.filter((r) => r.userIds.length > 0);
+    message.reactions = remaining.length > 0 ? remaining : undefined;
+
+    return { ok: true, reactions: remaining };
   }
 
   getClient(clientId: string): Client | undefined {
@@ -1498,6 +1812,10 @@ export class Room {
     return admins;
   }
 
+  isAdminClient(client: Client): boolean {
+    return client instanceof Admin && !client.isObserver;
+  }
+
   getAdminUserIds(): string[] {
     const userIds: string[] = [];
     for (const client of this.clients.values()) {
@@ -1693,24 +2011,50 @@ export class Room {
     return null;
   }
 
+  /**
+   * The webinar "program feed": what every attendee consumes.
+   *
+   * Audio is NOT curated — attendees always hear every panelist (all
+   * non-attendee audio producers, muted ones included so mute toggles flip
+   * the paused flag instead of churning consumers). Video is curated: the
+   * active screen share plus the presenter's camera (for a picture-in-picture
+   * of the presenter), otherwise the dominant speaker's camera.
+   */
   getWebinarFeedSnapshot(): {
     speakerUserId: string | null;
     producers: ProducerInfo[];
   } {
-    const screenShareOwnerUserId = this.getScreenShareOwnerUserId();
-    if (screenShareOwnerUserId) {
-      const screenShareFeedProducers =
-        this.getClientFeedProducers(screenShareOwnerUserId);
-      if (screenShareFeedProducers.length > 0) {
-        return {
-          speakerUserId: screenShareOwnerUserId,
-          producers: screenShareFeedProducers,
-        };
+    const producers: ProducerInfo[] = [];
+    const seenProducerIds = new Set<string>();
+    const push = (info: ProducerInfo | null | undefined): void => {
+      if (!info || seenProducerIds.has(info.producerId)) return;
+      seenProducerIds.add(info.producerId);
+      producers.push(info);
+    };
+
+    for (const [userId, client] of this.clients.entries()) {
+      if (client.isObserver) continue;
+      for (const info of this.getClientFeedProducers(userId)) {
+        if (info.kind === "audio") push(info);
       }
     }
 
-    const speakerUserId = this.selectWebinarActiveSpeakerUserId();
-    const producers = this.getClientFeedProducers(speakerUserId);
+    const screenShareOwnerUserId = this.getScreenShareOwnerUserId();
+    let speakerUserId: string | null = null;
+    if (screenShareOwnerUserId) {
+      speakerUserId = screenShareOwnerUserId;
+      for (const info of this.getClientFeedProducers(screenShareOwnerUserId)) {
+        if (info.kind === "video") push(info);
+      }
+    } else {
+      speakerUserId = this.selectWebinarActiveSpeakerUserId();
+      if (speakerUserId) {
+        for (const info of this.getClientFeedProducers(speakerUserId)) {
+          if (info.kind === "video" && info.type === "webcam") push(info);
+        }
+      }
+    }
+
     return { speakerUserId, producers };
   }
 
@@ -1720,18 +2064,20 @@ export class Room {
     producers: ProducerInfo[];
   } {
     const snapshot = this.getWebinarFeedSnapshot();
-    const producerIds = snapshot.producers
-      .map((producer) => producer.producerId)
+    // Paused state is part of the fingerprint: a mute/camera toggle must
+    // reach feed-only viewers even when the producer set is unchanged.
+    const producerFingerprints = snapshot.producers
+      .map((producer) => `${producer.producerId}:${producer.paused ? 1 : 0}`)
       .sort();
     const changed =
       this.webinarActiveSpeakerUserId !== snapshot.speakerUserId ||
-      this.webinarFeedProducerIds.length !== producerIds.length ||
-      this.webinarFeedProducerIds.some((producerId, index) => {
-        return producerId !== producerIds[index];
+      this.webinarFeedProducerIds.length !== producerFingerprints.length ||
+      this.webinarFeedProducerIds.some((fingerprint, index) => {
+        return fingerprint !== producerFingerprints[index];
       });
 
     this.webinarActiveSpeakerUserId = snapshot.speakerUserId;
-    this.webinarFeedProducerIds = producerIds;
+    this.webinarFeedProducerIds = producerFingerprints;
 
     return { changed, ...snapshot };
   }
@@ -2003,6 +2349,10 @@ export class Room {
     this.webinarActiveSpeakerUserId = null;
     this.webinarDominantSpeakerUserId = null;
     this.webinarFeedProducerIds = [];
+    this.webinarRaisedHandAt.clear();
+    this.webinarQaEntries.clear();
+    this.webinarPromotedUserKeys.clear();
+    this.webinarDemotedUserKeys.clear();
     this._meetingInviteCodeHash = null;
   }
 

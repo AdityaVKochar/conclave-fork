@@ -526,6 +526,7 @@ final class MeetingViewModel {
     private var meetingLifecycleGeneration = 0
     private var reconnectAttempts = 0
     private var reconnectRetryTask: Task<Void, Never>?
+    private var foregroundResumePresentationTask: Task<Void, Never>?
     private var pendingIceRestartTasks: [String: Task<Void, Never>] = [:]
     private var participantConnectionStatusTasks: [String: Task<Void, Never>] = [:]
     private var remoteConsumerBandwidthPolicyTask: Task<Void, Never>?
@@ -546,6 +547,12 @@ final class MeetingViewModel {
     // ack). Lets receiveChatMessage swap the optimistic row in place instead
     // of appending a transient duplicate.
     private var pendingOptimisticChatSends: [(id: String, signature: String)] = []
+    // Connection-recovery watchdog (see ConnectionRecoveryWatchdogPolicy):
+    // observable timestamps + a periodic tick that un-strands a recovery whose
+    // fire-and-forget tasks died holding the in-flight guards.
+    private var recoveryWatchdogTask: Task<Void, Never>?
+    private var recoveryStartedAt: Date?
+    private var lastJoinActivityAt = Date()
     private var pendingPreAckRosterEvents: [PendingPreAckRosterEvent] = []
     private var pendingPreAckWaitingRoomEvents: [PendingPreAckWaitingRoomEvent] = []
     private var pendingChatHistorySnapshot: ChatHistorySnapshotNotification?
@@ -579,6 +586,7 @@ final class MeetingViewModel {
     private var localAudioProducerReplacementToken: UUID?
     private var isCameraToggleInFlight = false
     private var isScreenShareToggleInFlight = false
+    private var videoPublishingPolicyRevision = 0
     private var isHandRaiseToggleInFlight = false
     private var isDisplayNameUpdateInFlight = false
     private var isCameraSwitchInFlight = false
@@ -2099,10 +2107,96 @@ final class MeetingViewModel {
     private func beginConnectionRecovery() {
         state.isRecoveringConnection = true
         state.connectionState = .reconnecting
+        if recoveryStartedAt == nil {
+            recoveryStartedAt = Date()
+        }
+        lastJoinActivityAt = Date()
+        startRecoveryWatchdogIfNeeded()
     }
 
     private func clearConnectionRecovery() {
         state.isRecoveringConnection = false
+        recoveryStartedAt = nil
+        stopRecoveryWatchdog()
+    }
+
+    private func scheduleForegroundResumePresentationRelease() {
+        foregroundResumePresentationTask?.cancel()
+        guard state.isResumingFromBackground else { return }
+        let lifecycleGeneration = meetingLifecycleGeneration
+        foregroundResumePresentationTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
+            guard !Task.isCancelled,
+                  let self,
+                  self.meetingLifecycleGeneration == lifecycleGeneration else { return }
+            self.state.isResumingFromBackground = false
+            self.foregroundResumePresentationTask = nil
+        }
+    }
+
+    // MARK: - Recovery watchdog
+
+    private func startRecoveryWatchdogIfNeeded() {
+        guard recoveryWatchdogTask == nil else { return }
+        let tickNanoseconds = UInt64(ConnectionRecoveryWatchdogPolicy.tickSeconds * 1_000_000_000.0)
+        recoveryWatchdogTask = Task { @MainActor [weak self] in
+            while true {
+                try? await Task.sleep(nanoseconds: tickNanoseconds)
+                if Task.isCancelled { return }
+                guard let viewModel = self else { return }
+                if !viewModel.runRecoveryWatchdogTick() { return }
+            }
+        }
+    }
+
+    private func stopRecoveryWatchdog() {
+        recoveryWatchdogTask?.cancel()
+        recoveryWatchdogTask = nil
+    }
+
+    /// One watchdog evaluation. Returns false when the watchdog should stop.
+    private func runRecoveryWatchdogTick() -> Bool {
+        guard let startedAt = recoveryStartedAt else { return false }
+        let action = ConnectionRecoveryWatchdogPolicy.action(
+            secondsSinceRecoveryStarted: Date().timeIntervalSince(startedAt),
+            secondsSinceLastJoinActivity: Date().timeIntervalSince(lastJoinActivityAt),
+            connectionState: state.connectionState,
+            isIntentionalLeave: isIntentionalLeave
+        )
+        switch action {
+        case .wait:
+            return true
+        case .standDown:
+            recoveryStartedAt = nil
+            recoveryWatchdogTask = nil
+            return false
+        case .forceRejoin:
+            PerformanceDiagnostics.event("recovery_watchdog_force_rejoin")
+            breakStalledRecoveryAndRejoin()
+            return true
+        case .fail:
+            PerformanceDiagnostics.event("recovery_watchdog_give_up")
+            recoveryStartedAt = nil
+            recoveryWatchdogTask = nil
+            Task { @MainActor [weak self] in
+                await self?.finishJoinFailure("Couldn't reconnect to the meeting. Check your connection and try again.")
+            }
+            return false
+        }
+    }
+
+    /// A stranded join attempt leaves `isRejoinInFlight`/retry guards set,
+    /// blocking every recovery entry point. Break the guards, then run the
+    /// normal fresh-token rejoin.
+    private func breakStalledRecoveryAndRejoin() {
+        reconnectRetryTask?.cancel()
+        reconnectRetryTask = nil
+        isRejoinInFlight = false
+        shouldRejoinAfterReconnect = true
+        lastJoinActivityAt = Date()
+        Task { @MainActor [weak self] in
+            await self?.forceRejoinWithFreshToken()
+        }
     }
 
     private func cancelPendingIceRestartTasks() {
@@ -2209,6 +2303,7 @@ final class MeetingViewModel {
 
         debugLog("[Meeting] Rejoin failed; retrying in \(Double(delayNanoseconds) / 1_000_000_000)s: \(error)")
         beginConnectionRecovery()
+        lastJoinActivityAt = Date()
         state.errorMessage = nil
         shouldRejoinAfterReconnect = true
         isRejoinInFlight = false
@@ -5363,6 +5458,7 @@ final class MeetingViewModel {
 
             guard !paused,
                   wasPaused == true,
+                  !(state.isAudioOnlyMode && kind == "video"),
                   let consumerId = webRTCClient.consumerId(forProducer: producer.producerId) else { continue }
             consumersToResume.append((consumerId: consumerId, requestKeyFrame: kind == "video"))
         }
@@ -5486,6 +5582,7 @@ final class MeetingViewModel {
             || previousConnectionState == .joined
             || previousConnectionState == .joining
         activeJoinAttemptId = joinAttemptId
+        lastJoinActivityAt = Date()
         clearPendingPreAckRoomEvents()
         if !reuseExistingSocket && (!isRecoveryJoin || socketManager.isConnected) {
             socketManager.disconnect()
@@ -6073,7 +6170,8 @@ final class MeetingViewModel {
             } else {
                 handleProducerState(producer)
             }
-            if let consumerId = webRTCClient.consumerId(forProducer: producer.producerId) {
+            if let consumerId = webRTCClient.consumerId(forProducer: producer.producerId),
+               !(state.isAudioOnlyMode && producer.kind == "video") {
                 try? await socketManager.resumeConsumer(consumerId: consumerId, requestKeyFrame: false)
             } else if webRTCClient.hasConsumerGeneration(forProducer: producer.producerId) {
                 // A planned make-before-break reset owns this producer. Its
@@ -6632,9 +6730,16 @@ final class MeetingViewModel {
     }
 
     func handleAppBecameActive() {
+        #if canImport(UIKit) && !SKIP
+        ScreenCaptureManager.shared.reconcileBroadcastLifecycle()
+        #endif
         if restorePersistedMeetingIfNeeded() {
+            foregroundResumePresentationTask?.cancel()
+            foregroundResumePresentationTask = nil
+            state.isResumingFromBackground = false
             return
         }
+        scheduleForegroundResumePresentationRelease()
         let shouldRestoreRemoteVideo = !appForegroundAllowsRemoteVideoReceive
         if shouldRestoreRemoteVideo {
             webcamReceiverCapacityAuthorityGeneration += 1
@@ -6645,8 +6750,8 @@ final class MeetingViewModel {
         case .waiting:
             let context = currentSocketEventContext()
             Task { @MainActor [weak self] in
-                guard let self,
-                      self.isCurrentSocketEvent(context) else { return }
+                guard let self else { return }
+                guard self.isCurrentSocketEvent(context) else { return }
                 await self.recoverActiveMeetingFromForeground()
                 if shouldRestoreRemoteVideo {
                     await self.applyRemoteConsumerBandwidthPolicy()
@@ -6656,6 +6761,9 @@ final class MeetingViewModel {
         case .joined, .reconnecting:
             break
         default:
+            foregroundResumePresentationTask?.cancel()
+            foregroundResumePresentationTask = nil
+            state.isResumingFromBackground = false
             return
         }
 
@@ -6665,8 +6773,8 @@ final class MeetingViewModel {
 
         let context = currentSocketEventContext()
         Task { @MainActor [weak self] in
-            guard let self,
-                  self.isCurrentSocketEvent(context) else { return }
+            guard let self else { return }
+            guard self.isCurrentSocketEvent(context) else { return }
             await self.recoverActiveMeetingFromForeground()
             if shouldRestoreRemoteVideo {
                 await self.applyRemoteConsumerBandwidthPolicy()
@@ -6680,6 +6788,21 @@ final class MeetingViewModel {
 
     func handleAppEnteredBackground() {
         persistMeetingResumeSnapshot()
+        foregroundResumePresentationTask?.cancel()
+        foregroundResumePresentationTask = nil
+        switch state.connectionState {
+        case .joined, .reconnecting, .waiting:
+            state.isResumingFromBackground = true
+        default:
+            state.isResumingFromBackground = false
+        }
+        #if os(iOS) && !SKIP
+        if CallSessionCoordinator.shared.isInCall {
+            CallAudioSession.shared.maintainBackgroundCall()
+            webRTCClient.activateCallAudioSession()
+        }
+        ScreenCaptureManager.shared.reconcileBroadcastLifecycle()
+        #endif
         let wasForeground = appForegroundAllowsRemoteVideoReceive
         webcamReceiverCapacityAuthorityGeneration += 1
         appForegroundAllowsRemoteVideoReceive = false
@@ -6954,12 +7077,14 @@ final class MeetingViewModel {
         isDisplayNameUpdateInFlight = false
         adminActionsInFlight.removeAll()
         state.chatMessages.removeAll()
+        state.isChatImageUploading = false
         pendingOptimisticChatSends.removeAll()
         clearChatOverlayMessages()
         clearReactions()
         state.isHandRaised = false
         state.isScreenSharing = false
         state.isMuted = true
+        state.isAudioOnlyMode = false
         setLocalCameraOffState(true)
         state.activeScreenShareUserId = nil
         state.activeSpeakerId = nil
@@ -7024,6 +7149,9 @@ final class MeetingViewModel {
         screenSharePublishConnectionQuality = .unknown
         receiveConnectionQuality = .unknown
         state.isRecoveringConnection = false
+        foregroundResumePresentationTask?.cancel()
+        foregroundResumePresentationTask = nil
+        state.isResumingFromBackground = false
         lastJoinContext = nil
     }
 
@@ -7248,6 +7376,7 @@ final class MeetingViewModel {
     }
 
     func toggleCamera() {
+        guard !state.isAudioOnlyMode else { return }
         guard MeetingMediaControlAvailabilityPolicy.canChangeLocalMediaIntent(
             connectionState: state.connectionState,
             isRecoveringConnection: state.isRecoveringConnection,
@@ -7261,6 +7390,7 @@ final class MeetingViewModel {
               !isCameraToggleInFlight else { return }
         let actionRoomId = state.roomId
         let actionJoinAttemptId = activeJoinAttemptId
+        let actionVideoPolicyRevision = videoPublishingPolicyRevision
         isCameraToggleInFlight = true
         let newState = !state.isCameraOff
         setLocalCameraOffState(newState, syncCallPresence: newState)
@@ -7279,6 +7409,13 @@ final class MeetingViewModel {
                     await webRTCClient.closeLocalVideoProducer()
                 } else {
                     try await enableOrStartLocalVideo()
+                    guard isCurrentJoinedCall(roomId: actionRoomId, joinAttemptId: actionJoinAttemptId) else { return }
+                    guard actionVideoPolicyRevision == videoPublishingPolicyRevision,
+                          !state.isAudioOnlyMode else {
+                        await webRTCClient.closeLocalVideoProducer()
+                        setLocalCameraOffState(true)
+                        return
+                    }
                     setLocalCameraOffState(false)
                 }
             } catch {
@@ -7287,6 +7424,22 @@ final class MeetingViewModel {
                 state.errorMessage = MeetingMediaErrorPresentation.message(for: error)
             }
         }
+    }
+
+    func setAudioOnlyMode(_ enabled: Bool) {
+        guard state.isAudioOnlyMode != enabled else { return }
+        state.isAudioOnlyMode = enabled
+        videoPublishingPolicyRevision += 1
+        if enabled && !state.isCameraOff {
+            setLocalCameraOffState(true)
+            Task { @MainActor [weak self] in
+                await self?.webRTCClient.closeLocalVideoProducer()
+            }
+        }
+        if enabled && state.isScreenSharing {
+            toggleScreenShare()
+        }
+        scheduleRemoteConsumerBandwidthPolicyUpdate()
     }
 
     var localCameraFacing: LocalCameraFacing {
@@ -7299,6 +7452,7 @@ final class MeetingViewModel {
 
     func canSwitchLocalCamera() -> Bool {
         state.connectionState == .joined
+            && !state.isAudioOnlyMode
             && !state.mediaPublishingDisabled
             && !isCameraSwitchInFlight
             && webRTCClient.canSwitchCamera()
@@ -7336,6 +7490,7 @@ final class MeetingViewModel {
     func toggleScreenShare() {
         guard state.connectionState == .joined,
               !state.mediaPublishingDisabled,
+              (!state.isAudioOnlyMode || state.isScreenSharing),
               !isScreenShareToggleInFlight else { return }
         if !state.isScreenSharing,
            let activeScreenShareUserId = state.activeScreenShareUserId,
@@ -7345,6 +7500,7 @@ final class MeetingViewModel {
         }
         let actionRoomId = state.roomId
         let actionJoinAttemptId = activeJoinAttemptId
+        let actionVideoPolicyRevision = videoPublishingPolicyRevision
         isScreenShareToggleInFlight = true
         #if canImport(UIKit) && !SKIP
         Task { @MainActor in
@@ -7379,6 +7535,12 @@ final class MeetingViewModel {
                         await ScreenCaptureManager.shared.stopCapture()
                         return
                     }
+                    guard actionVideoPolicyRevision == videoPublishingPolicyRevision,
+                          !state.isAudioOnlyMode else {
+                        ScreenCaptureManager.shared.onBroadcastStopped = nil
+                        await ScreenCaptureManager.shared.stopCapture()
+                        return
+                    }
                     guard ScreenCaptureManager.shared.isCaptureActive else {
                         ScreenCaptureManager.shared.onBroadcastStopped = nil
                         await ScreenCaptureManager.shared.stopCapture()
@@ -7387,6 +7549,8 @@ final class MeetingViewModel {
                     try await webRTCClient.startScreenSharing()
                     let isCurrentCallAfterStart = isCurrentJoinedCall(roomId: actionRoomId, joinAttemptId: actionJoinAttemptId)
                     guard isCurrentCallAfterStart,
+                          actionVideoPolicyRevision == videoPublishingPolicyRevision,
+                          !state.isAudioOnlyMode,
                           ScreenCaptureManager.shared.isCaptureActive else {
                         ScreenCaptureManager.shared.onBroadcastStopped = nil
                         await ScreenCaptureManager.shared.stopCapture()
@@ -7451,6 +7615,14 @@ final class MeetingViewModel {
                     }
                     return
                 }
+                guard actionVideoPolicyRevision == videoPublishingPolicyRevision,
+                      !state.isAudioOnlyMode else {
+                    ScreenCaptureManager.onProjectionRevoked = nil
+                    if granted {
+                        ScreenCaptureManager.stopCapture()
+                    }
+                    return
+                }
                 if granted {
                     do {
                         guard ScreenCaptureManager.isCaptureActive() else {
@@ -7461,6 +7633,8 @@ final class MeetingViewModel {
                         try await webRTCClient.startScreenSharing()
                         let isCurrentCallAfterStart = isCurrentJoinedCall(roomId: actionRoomId, joinAttemptId: actionJoinAttemptId)
                         guard isCurrentCallAfterStart,
+                              actionVideoPolicyRevision == videoPublishingPolicyRevision,
+                              !state.isAudioOnlyMode,
                               ScreenCaptureManager.isCaptureActive() else {
                             ScreenCaptureManager.onProjectionRevoked = nil
                             ScreenCaptureManager.stopCapture()
@@ -7764,6 +7938,7 @@ final class MeetingViewModel {
     }
 
     private var shouldReceiveRemoteVideoConsumers: Bool {
+        guard !state.isAudioOnlyMode else { return false }
         #if SKIP
         if PipController.inPipMode { return true }
         #endif
@@ -8133,6 +8308,7 @@ final class MeetingViewModel {
     private func sendChatContent(
         _ content: String,
         gif: ChatGifAttachment? = nil,
+        image: ChatImageAttachment? = nil,
         replyTo: ChatReplyPreview? = nil,
         replacingOptimisticMessageId optimisticMessageId: String? = nil,
         context: CallActionContext? = nil
@@ -8145,7 +8321,7 @@ final class MeetingViewModel {
         guard isCurrentJoinedCall(actionContext) else {
             throw MeetingActionResponseError(message: "Reconnect before sending chat.")
         }
-        let message = try await socketManager.sendChat(content: content, gif: gif, replyTo: replyTo)
+        let message = try await socketManager.sendChat(content: content, gif: gif, image: image, replyTo: replyTo)
         guard isCurrentJoinedCall(actionContext) else {
             if let optimisticMessageId {
                 removeOptimisticChatMessage(id: optimisticMessageId)
@@ -8167,6 +8343,7 @@ final class MeetingViewModel {
     private func sendChatContentOptimistically(
         _ content: String,
         gif: ChatGifAttachment? = nil,
+        image: ChatImageAttachment? = nil,
         replyTo: ChatReplyPreview? = nil,
         context: CallActionContext
     ) async throws -> ChatMessage {
@@ -8174,7 +8351,7 @@ final class MeetingViewModel {
         guard state.connectionState == .joined else {
             throw MeetingActionResponseError(message: "Reconnect before sending chat.")
         }
-        let optimisticMessage = appendOptimisticChatMessage(content: content, gif: gif, replyTo: replyTo)
+        let optimisticMessage = appendOptimisticChatMessage(content: content, gif: gif, image: image, replyTo: replyTo)
         do {
             guard isCurrentJoinedCall(context) else {
                 if let optimisticMessage {
@@ -8185,6 +8362,7 @@ final class MeetingViewModel {
             return try await sendChatContent(
                 content,
                 gif: gif,
+                image: image,
                 replyTo: replyTo,
                 replacingOptimisticMessageId: optimisticMessage?.id,
                 context: context
@@ -8234,6 +8412,7 @@ final class MeetingViewModel {
                $0.signature == Self.chatEchoSignature(
                    content: normalized.content,
                    gif: normalized.gif,
+                   image: normalized.image,
                    replyTo: normalized.replyTo
                )
            }) {
@@ -8252,9 +8431,10 @@ final class MeetingViewModel {
     static func chatEchoSignature(
         content: String,
         gif: ChatGifAttachment?,
+        image: ChatImageAttachment?,
         replyTo: ChatReplyPreview?
     ) -> String {
-        "\(content)|\(gif?.url ?? "")|\(replyTo?.id ?? "")"
+        "\(content)|\(gif?.url ?? "")|\(image?.url ?? "")|\(replyTo?.id ?? "")"
     }
 
     @discardableResult
@@ -8273,6 +8453,7 @@ final class MeetingViewModel {
             content: shouldKeepExistingContent ? existing.content : incoming.content,
             timestamp: existing.timestamp,
             gif: incoming.gif ?? existing.gif,
+            image: incoming.image ?? existing.image,
             isDirect: incoming.isDirect,
             dmTargetUserId: incoming.dmTargetUserId,
             dmTargetDisplayName: incoming.dmTargetDisplayName,
@@ -8285,6 +8466,7 @@ final class MeetingViewModel {
     private func appendOptimisticChatMessage(
         content: String,
         gif: ChatGifAttachment? = nil,
+        image: ChatImageAttachment? = nil,
         replyTo: ChatReplyPreview? = nil
     ) -> ChatMessage? {
         let normalizedSfuUserId = state.sfuUserId?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -8295,6 +8477,7 @@ final class MeetingViewModel {
             displayName: localDisplayNameForFeedback,
             content: content,
             gif: gif,
+            image: image,
             roomId: state.roomId,
             replyTo: replyTo
         )
@@ -8308,6 +8491,7 @@ final class MeetingViewModel {
                 signature: Self.chatEchoSignature(
                     content: appended.content,
                     gif: appended.gif,
+                    image: appended.image,
                     replyTo: appended.replyTo
                 )
             ))
@@ -8382,6 +8566,7 @@ final class MeetingViewModel {
                 content: message.content,
                 timestamp: message.timestamp,
                 gif: message.gif,
+                image: message.image,
                 isDirect: message.isDirect,
                 dmTargetUserId: message.dmTargetUserId,
                 dmTargetDisplayName: targetDisplayName,
@@ -8397,6 +8582,7 @@ final class MeetingViewModel {
             content: content,
             timestamp: message.timestamp,
             gif: message.gif,
+            image: message.image,
             isDirect: message.isDirect,
             dmTargetUserId: message.dmTargetUserId,
             dmTargetDisplayName: targetDisplayName,
@@ -8429,6 +8615,7 @@ final class MeetingViewModel {
             content: message.content,
             timestamp: message.timestamp,
             gif: message.gif,
+            image: message.image,
             isDirect: message.isDirect,
             dmTargetUserId: message.dmTargetUserId,
             dmTargetDisplayName: targetDisplayName,
@@ -8469,6 +8656,7 @@ final class MeetingViewModel {
             ),
             content: replyTo.content,
             hasGif: replyTo.hasGif,
+            hasImage: replyTo.hasImage,
             isDirect: replyTo.isDirect,
             dmTargetUserId: replyTo.dmTargetUserId
         )
@@ -8530,6 +8718,125 @@ final class MeetingViewModel {
     func sendChatGif(_ gif: ChatGifAttachment, replyTo: ChatReplyPreview? = nil) {
         let title = gif.title.trimmingCharacters(in: .whitespacesAndNewlines)
         sendChatMessageContent(title.isEmpty ? "GIF" : title, gif: gif, replyTo: replyTo)
+    }
+
+    /// Uploads a picked image through the SFU's moderated asset store and
+    /// sends it as a chat attachment with the caption (mirrors the web's
+    /// sendChatImage: authorize -> bearer POST -> send). Size/type limits and
+    /// error copy match the web client.
+    /// Uploads and sends a chat image. Returns true when the message went out;
+    /// false lets the composer restore the caption/reply it staged.
+    @discardableResult
+    func sendChatImage(fileURL: URL, caption: String, replyTo: ChatReplyPreview? = nil) async -> Bool {
+        guard state.connectionState == .joined else {
+            state.errorMessage = "Reconnect before sending chat."
+            return false
+        }
+        guard !state.isWebinarAttendee else { return false }
+        if state.isChatLocked && !state.isAdmin {
+            addSystemMessage(.info("Chat is locked by the host."))
+            return false
+        }
+        guard state.isImageAttachmentsEnabled else {
+            addSystemMessage(.info("Image attachments are disabled by the host."))
+            return false
+        }
+        guard !state.isChatImageUploading else { return false }
+
+        let trimmedCaption = caption.trimmingCharacters(in: .whitespacesAndNewlines)
+        let actionContext = currentCallActionContext()
+        state.isChatImageUploading = true
+        defer { state.isChatImageUploading = false }
+
+        do {
+            // Reject oversized files from metadata BEFORE reading the bytes: a
+            // picker result can be tens of megabytes, and reading it first
+            // would buffer it all just to throw it away.
+            if let attributeSize = try? FileManager.default.attributesOfItem(atPath: fileURL.path)[FileAttributeKey.size],
+               let declaredByteCount = attributeSize as? Int,
+               declaredByteCount > 0,
+               !ChatImageSendPolicy.isAcceptableSize(declaredByteCount) {
+                addSystemMessage(.info("Images can be up to 6 MB."))
+                return false
+            }
+            let data = try await Task.detached(priority: .userInitiated) {
+                try Data(contentsOf: fileURL)
+            }.value
+            guard let mimeType = ChatImageSendPolicy.mimeType(forData: data) else {
+                addSystemMessage(.info("That image type isn't supported. Use JPEG, PNG, GIF, or WebP."))
+                return false
+            }
+            guard ChatImageSendPolicy.isAcceptableSize(data.count) else {
+                addSystemMessage(.info("Images can be up to 6 MB."))
+                return false
+            }
+            let authorization = try await socketManager.authorizeChatImageUpload()
+            guard data.count <= authorization.maxBytes else {
+                addSystemMessage(.info("Images can be up to 6 MB."))
+                return false
+            }
+            let fileName = ChatImageSendPolicy.uploadFileName(
+                originalName: fileURL.lastPathComponent,
+                mimeType: mimeType
+            )
+            let image = try await uploadChatImage(
+                data: data,
+                fileName: fileName,
+                mimeType: mimeType,
+                authorization: authorization
+            )
+            guard isCurrentJoinedCall(actionContext) else { return false }
+            _ = try await sendChatContentOptimistically(
+                trimmedCaption,
+                image: image,
+                replyTo: replyTo,
+                context: actionContext
+            )
+            return true
+        } catch let error as ChatImageUploadError {
+            guard isCurrentJoinedCall(actionContext) else { return false }
+            addSystemMessage(.info(error.message))
+            return false
+        } catch {
+            guard isCurrentJoinedCall(actionContext) else { return false }
+            addSystemMessage(.info("Image upload failed. Check your connection."))
+            return false
+        }
+    }
+
+    private func uploadChatImage(
+        data: Data,
+        fileName: String,
+        mimeType: String,
+        authorization: ChatImageUploadAuthorization
+    ) async throws -> ChatImageAttachment {
+        guard var components = URLComponents(string: authorization.uploadUrl) else {
+            throw ChatImageUploadError(message: "Image upload is unavailable right now.")
+        }
+        var queryItems = components.queryItems ?? []
+        queryItems.append(URLQueryItem(name: "name", value: fileName))
+        components.queryItems = queryItems
+        guard let url = components.url else {
+            throw ChatImageUploadError(message: "Image upload is unavailable right now.")
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.timeoutInterval = 45
+        request.setValue("Bearer \(authorization.token)", forHTTPHeaderField: "Authorization")
+        request.setValue(mimeType, forHTTPHeaderField: "Content-Type")
+        request.httpBody = data
+
+        let (responseData, response) = try await URLSession.shared.data(for: request)
+        let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
+        let result = try? JSONDecoder().decode(ChatImageUploadResult.self, from: responseData)
+        if statusCode >= 200, statusCode < 300, let image = result?.image {
+            return image
+        }
+        if result?.code == ChatImageSendPolicy.moderationBlockedCode {
+            throw ChatImageUploadError(message: "That image was blocked by moderation.")
+        }
+        throw ChatImageUploadError(message: result?.error ?? "Image upload failed.")
     }
 
     private func sendChatMessageContent(

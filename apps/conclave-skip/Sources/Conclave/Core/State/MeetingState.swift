@@ -123,6 +123,10 @@ final class MeetingState {
             )
         }
     }
+    /// True while a connected call is moving through an expected app
+    /// background/foreground transition. Transport recovery may briefly run,
+    /// but it should not be presented as a user-facing outage.
+    var isResumingFromBackground: Bool = false
     var errorMessage: String?
     var joinFormErrorMessage: String?
     var meetingEndedNoticeMessage: String?
@@ -152,6 +156,8 @@ final class MeetingState {
     var isNoGuests: Bool = false
     var isDmEnabled: Bool = true
     var isImageAttachmentsEnabled: Bool = true
+    // True while a picked chat image is uploading to the asset store.
+    var isChatImageUploading: Bool = false
     var isTtsDisabled: Bool = false
     var isReactionsDisabled: Bool = false
     var meetingRequiresInviteCode: Bool = false
@@ -202,6 +208,7 @@ final class MeetingState {
     // Media State
     var isMuted: Bool = true
     var isCameraOff: Bool = true
+    var isAudioOnlyMode: Bool = false
     var isScreenSharing: Bool = false
     var isHandRaised: Bool = false
     var videoQuality: VideoQuality = .standard

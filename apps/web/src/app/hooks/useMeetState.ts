@@ -9,6 +9,8 @@ import type {
   MeetError,
   Participant,
   WebinarConfigSnapshot,
+  WebinarHandQueueEntry,
+  WebinarQaEntry,
 } from "../lib/types";
 
 interface UseMeetStateOptions {
@@ -69,6 +71,17 @@ export function useMeetState({ initialRoomId }: UseMeetStateOptions) {
   const [webinarSpeakerUserId, setWebinarSpeakerUserId] = useState<string | null>(
     null,
   );
+  const [webinarQaEntries, setWebinarQaEntries] = useState<WebinarQaEntry[]>(
+    [],
+  );
+  const [webinarHandQueue, setWebinarHandQueue] = useState<
+    WebinarHandQueueEntry[]
+  >([]);
+  const [isWebinarHandRaised, setIsWebinarHandRaised] = useState(false);
+  const [webinarStageInvite, setWebinarStageInvite] = useState<{
+    promotedByName?: string;
+    rejoinRoomId: string;
+  } | null>(null);
   const [serverRestartNotice, setServerRestartNotice] = useState<string | null>(
     null,
   );
@@ -137,6 +150,14 @@ export function useMeetState({ initialRoomId }: UseMeetStateOptions) {
     webinarLink,
     setWebinarLink,
     webinarSpeakerUserId,
+    webinarQaEntries,
+    setWebinarQaEntries,
+    webinarHandQueue,
+    setWebinarHandQueue,
+    isWebinarHandRaised,
+    setIsWebinarHandRaised,
+    webinarStageInvite,
+    setWebinarStageInvite,
     setWebinarSpeakerUserId,
     serverRestartNotice,
     setServerRestartNotice,

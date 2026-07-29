@@ -3,6 +3,7 @@ import { Logger } from "../../utilities/loggers.js";
 import type { SfuState } from "../state.js";
 import { createConnectionContext, setSocketContext } from "./context.js";
 import { registerChatHandlers } from "./handlers/chatHandlers.js";
+import { registerChatReactionHandlers } from "./handlers/chatReactionHandlers.js";
 import { registerDisconnectHandlers } from "./handlers/disconnectHandlers.js";
 import { registerDisplayNameHandlers } from "./handlers/displayNameHandlers.js";
 import { registerHandHandlers } from "./handlers/handHandlers.js";
@@ -17,6 +18,7 @@ import { registerTranscriptHandlers } from "./handlers/transcriptHandlers.js";
 import { registerAppsHandlers } from "./handlers/appsHandlers.js";
 import { registerGameHandlers } from "./handlers/gameHandlers.js";
 import { registerWebinarHandlers } from "./handlers/webinarHandlers.js";
+import { registerWebinarInteractionHandlers } from "./handlers/webinarInteractionHandlers.js";
 
 export const registerConnectionHandlers = (
   io: SocketIOServer,
@@ -34,12 +36,14 @@ export const registerConnectionHandlers = (
     registerMediaHandlers(context);
     registerDisplayNameHandlers(context);
     registerChatHandlers(context);
+    registerChatReactionHandlers(context);
     registerReactionHandlers(context);
     registerHandHandlers(context);
     registerAppsHandlers(context);
     registerGameHandlers(context);
     registerMeetingHandlers(context);
     registerWebinarHandlers(context);
+    registerWebinarInteractionHandlers(context);
     registerSharedBrowserHandlers(context);
     registerTranscriptHandlers(context);
     registerDisconnectHandlers(context);

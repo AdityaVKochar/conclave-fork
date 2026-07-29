@@ -146,6 +146,69 @@ final class ConclaveTests: XCTestCase {
         XCTAssertNil(ordinaryObject["webcamReceiverCapacityTransition"])
     }
 
+    func testConnectionRecoveryWatchdogPolicyActions() {
+        // Progressing recovery: recent join activity keeps the watchdog quiet.
+        XCTAssertEqual(
+            ConnectionRecoveryWatchdogPolicy.action(
+                secondsSinceRecoveryStarted: 10,
+                secondsSinceLastJoinActivity: 5,
+                connectionState: ConnectionState.reconnecting,
+                isIntentionalLeave: false
+            ),
+            ConnectionRecoveryWatchdogPolicy.Action.wait
+        )
+        // Stranded recovery: no join activity past the stall threshold forces
+        // a fresh rejoin even while the state still claims to be joining.
+        XCTAssertEqual(
+            ConnectionRecoveryWatchdogPolicy.action(
+                secondsSinceRecoveryStarted: 40,
+                secondsSinceLastJoinActivity: 30,
+                connectionState: ConnectionState.joining,
+                isIntentionalLeave: false
+            ),
+            ConnectionRecoveryWatchdogPolicy.Action.forceRejoin
+        )
+        // Hard cap wins over another force cycle.
+        XCTAssertEqual(
+            ConnectionRecoveryWatchdogPolicy.action(
+                secondsSinceRecoveryStarted: 121,
+                secondsSinceLastJoinActivity: 26,
+                connectionState: ConnectionState.reconnecting,
+                isIntentionalLeave: false
+            ),
+            ConnectionRecoveryWatchdogPolicy.Action.fail
+        )
+        // Reaching a settled or terminal state stands the watchdog down.
+        XCTAssertEqual(
+            ConnectionRecoveryWatchdogPolicy.action(
+                secondsSinceRecoveryStarted: 40,
+                secondsSinceLastJoinActivity: 40,
+                connectionState: ConnectionState.joined,
+                isIntentionalLeave: false
+            ),
+            ConnectionRecoveryWatchdogPolicy.Action.standDown
+        )
+        XCTAssertEqual(
+            ConnectionRecoveryWatchdogPolicy.action(
+                secondsSinceRecoveryStarted: 40,
+                secondsSinceLastJoinActivity: 40,
+                connectionState: ConnectionState.error,
+                isIntentionalLeave: false
+            ),
+            ConnectionRecoveryWatchdogPolicy.Action.standDown
+        )
+        // An intentional leave always stands down, whatever the timers say.
+        XCTAssertEqual(
+            ConnectionRecoveryWatchdogPolicy.action(
+                secondsSinceRecoveryStarted: 500,
+                secondsSinceLastJoinActivity: 500,
+                connectionState: ConnectionState.reconnecting,
+                isIntentionalLeave: true
+            ),
+            ConnectionRecoveryWatchdogPolicy.Action.standDown
+        )
+    }
+
     func testTranscriptPresentationPolicyOrdersAndGroupsSegments() throws {
         let unordered = [
             TranscriptSegmentModel(itemId: "b", sequence: 2, speakerUserId: "alex", speakerDisplayName: "Alex", text: "later", startMs: 3_000, isFinal: true),
@@ -199,7 +262,7 @@ final class ConclaveTests: XCTestCase {
     }
 
     func testTranscriptConfigurationMatchesWebModelCatalog() throws {
-        XCTAssertEqual(TranscriptConfiguration.defaultTranscriptModel, "gpt-realtime-whisper")
+        XCTAssertEqual(TranscriptConfiguration.defaultTranscriptModel, "gpt-live-transcribe")
         XCTAssertEqual(TranscriptConfiguration.defaultAssistantModel, "gpt-5.6-terra")
         XCTAssertEqual(TranscriptConfiguration.providers.map(\.rawValue), ["openai", "sarvam"])
         XCTAssertEqual(
@@ -330,8 +393,19 @@ final class ConclaveTests: XCTestCase {
         XCTAssertTrue(panel.contains(".acmColorBackground(ACMColors.surface)"))
         XCTAssertTrue(panel.contains("@State private var navigation = TranscriptPanelNavigationState()"))
         XCTAssertFalse(panel.contains("@State private var activeTab"))
+        XCTAssertTrue(panel.contains("private var titleRow: some View"))
+        XCTAssertTrue(panel.contains("private var sessionAttribution: some View"))
+        XCTAssertTrue(panel.contains(".padding(.top, 15)"))
         XCTAssertTrue(panel.contains("Text(\"Stop\")"))
         XCTAssertTrue(panel.contains("ACMColors.error.opacity(0.12)"))
+        XCTAssertEqual(TranscriptPanelView.runningDetentFraction, 0.72)
+        XCTAssertGreaterThan(TranscriptPanelView.runningDetentFraction, MeetingSheetView.detentFraction)
+        XCTAssertTrue(panel.contains("@State private var selectedPresentationDetent: PresentationDetent"))
+        XCTAssertTrue(panel.contains(".presentationDetents(presentationDetents, selection: $selectedPresentationDetent)"))
+        XCTAssertTrue(panel.contains(".fraction(MeetingSheetView.detentFraction),"))
+        XCTAssertTrue(panel.contains(".fraction(Self.runningDetentFraction),"))
+        XCTAssertTrue(panel.contains(".large"))
+        XCTAssertTrue(panel.contains(".presentationDragIndicator(.visible)"))
         XCTAssertTrue(service.contains("case \"minutes.updated\":"))
         XCTAssertTrue(service.contains("case \"qa.delta\":"))
         XCTAssertTrue(service.contains("[\"type\": \"session.pause\"]"))
@@ -2755,6 +2829,67 @@ final class ConclaveTests: XCTestCase {
         ))
     }
 
+    func testScreenCaptureReconnectPolicyKeepsCurrentServerAliveDuringTransientDisconnect() throws {
+        XCTAssertEqual(ScreenCaptureReconnectPolicy.graceNanoseconds, 8_000_000_000)
+        XCTAssertTrue(ScreenCaptureReconnectPolicy.shouldFinalizeDisconnect(
+            generation: 4,
+            currentGeneration: 4,
+            hasServer: true,
+            isConnected: false
+        ))
+        XCTAssertFalse(ScreenCaptureReconnectPolicy.shouldFinalizeDisconnect(
+            generation: 4,
+            currentGeneration: 4,
+            hasServer: true,
+            isConnected: true
+        ))
+        XCTAssertFalse(ScreenCaptureReconnectPolicy.shouldFinalizeDisconnect(
+            generation: 4,
+            currentGeneration: 5,
+            hasServer: true,
+            isConnected: false
+        ))
+    }
+
+    func testAppLifecyclePolicyDeduplicatesNativeSceneDelivery() throws {
+        XCTAssertFalse(ConclaveAppLifecyclePolicy.shouldDeliver(
+            previous: ConclaveAppLifecyclePhase.active,
+            next: ConclaveAppLifecyclePhase.active
+        ))
+        XCTAssertFalse(ConclaveAppLifecyclePolicy.shouldDeliver(
+            previous: ConclaveAppLifecyclePhase.background,
+            next: ConclaveAppLifecyclePhase.background
+        ))
+        XCTAssertTrue(ConclaveAppLifecyclePolicy.shouldDeliver(
+            previous: ConclaveAppLifecyclePhase.inactive,
+            next: ConclaveAppLifecyclePhase.background
+        ))
+        XCTAssertTrue(ConclaveAppLifecyclePolicy.shouldDeliver(
+            previous: ConclaveAppLifecyclePhase.background,
+            next: ConclaveAppLifecyclePhase.active
+        ))
+    }
+
+    func testScreenShareLifecycleBusStateRoundTrips() throws {
+        XCTAssertEqual(
+            ScreenShareBroadcastLifecycleState(rawValue: "starting"),
+            ScreenShareBroadcastLifecycleState.starting
+        )
+        XCTAssertEqual(
+            ScreenShareBroadcastLifecycleState(rawValue: "active"),
+            ScreenShareBroadcastLifecycleState.active
+        )
+        XCTAssertEqual(
+            ScreenShareBroadcastLifecycleState(rawValue: "reconnecting"),
+            ScreenShareBroadcastLifecycleState.reconnecting
+        )
+        XCTAssertEqual(
+            ScreenShareBroadcastLifecycleState(rawValue: "stopped"),
+            ScreenShareBroadcastLifecycleState.stopped
+        )
+        XCTAssertNil(ScreenShareBroadcastLifecycleState(rawValue: "unknown"))
+    }
+
     @MainActor
     func testLocalIdentityAliasDoesNotResolveToRemoteParticipant() throws {
         let state = MeetingState(userId: "alex@example.com#local-session", sessionId: "local-session")
@@ -4475,6 +4610,7 @@ final class ConclaveTests: XCTestCase {
         viewModel.state.connectionState = ConnectionState.joined
         viewModel.state.isMuted = false
         viewModel.state.isCameraOff = false
+        viewModel.state.isAudioOnlyMode = true
         viewModel.state.isScreenSharing = true
         viewModel.state.activeScreenShareUserId = viewModel.state.userId
 
@@ -4482,8 +4618,24 @@ final class ConclaveTests: XCTestCase {
 
         XCTAssertTrue(viewModel.state.isMuted)
         XCTAssertTrue(viewModel.state.isCameraOff)
+        XCTAssertFalse(viewModel.state.isAudioOnlyMode)
         XCTAssertFalse(viewModel.state.isScreenSharing)
         XCTAssertNil(viewModel.state.activeScreenShareUserId)
+    }
+
+    @MainActor
+    func testAudioOnlyImmediatelyDisablesCameraIntent() {
+        let viewModel = MeetingViewModel()
+        viewModel.state = MeetingState(userId: "local@example.com#local-session", sessionId: "local-session")
+        viewModel.state.roomId = "room-a"
+        viewModel.state.connectionState = ConnectionState.joined
+        viewModel.state.isCameraOff = false
+
+        viewModel.setAudioOnlyMode(true)
+        viewModel.toggleCamera()
+
+        XCTAssertTrue(viewModel.state.isAudioOnlyMode)
+        XCTAssertTrue(viewModel.state.isCameraOff)
     }
     #endif
 
@@ -5063,6 +5215,7 @@ final class ConclaveTests: XCTestCase {
                     content: "old history",
                     timestamp: 1_000,
                     gif: nil,
+                    image: nil,
                     isDirect: false,
                     dmTargetUserId: nil,
                     dmTargetDisplayName: nil,
@@ -5081,6 +5234,7 @@ final class ConclaveTests: XCTestCase {
                     content: "latest history",
                     timestamp: 2_000,
                     gif: nil,
+                    image: nil,
                     isDirect: false,
                     dmTargetUserId: nil,
                     dmTargetDisplayName: nil,
@@ -5125,6 +5279,7 @@ final class ConclaveTests: XCTestCase {
                     content: "later",
                     timestamp: 3_000,
                     gif: nil,
+                    image: nil,
                     isDirect: false,
                     dmTargetUserId: nil,
                     dmTargetDisplayName: nil,
@@ -5138,6 +5293,7 @@ final class ConclaveTests: XCTestCase {
                     content: "duplicate",
                     timestamp: 4_000,
                     gif: nil,
+                    image: nil,
                     isDirect: false,
                     dmTargetUserId: nil,
                     dmTargetDisplayName: nil,
@@ -5151,6 +5307,7 @@ final class ConclaveTests: XCTestCase {
                     content: "private",
                     timestamp: 1_000,
                     gif: nil,
+                    image: nil,
                     isDirect: true,
                     dmTargetUserId: "someone-else@example.com#session",
                     dmTargetDisplayName: nil,
@@ -5170,6 +5327,7 @@ final class ConclaveTests: XCTestCase {
                     content: "stale",
                     timestamp: 5_000,
                     gif: nil,
+                    image: nil,
                     isDirect: false,
                     dmTargetUserId: nil,
                     dmTargetDisplayName: nil,
@@ -5201,6 +5359,7 @@ final class ConclaveTests: XCTestCase {
                     content: "/tts\thello world",
                     timestamp: 3_000,
                     gif: nil,
+                    image: nil,
                     isDirect: false,
                     dmTargetUserId: nil,
                     dmTargetDisplayName: nil,
@@ -7281,12 +7440,46 @@ final class ConclaveTests: XCTestCase {
     func testIOSChatComposerOwnsSafeAreaAndKeyboardClearance() throws {
         XCTAssertEqual(
             ChatComposerLayout.composerBottomPadding(isAndroid: false, contentInset: 34),
-            48
+            34
         )
         XCTAssertEqual(
             ChatComposerLayout.composerBottomPadding(isAndroid: false, contentInset: -20),
             14
         )
+
+        let source = try sourceFileContents("Sources/Conclave/Features/Meeting/ChatViews.swift")
+        XCTAssertTrue(source.contains("private func openGifPicker()"))
+        XCTAssertTrue(source.contains("private func openImagePicker()"))
+        XCTAssertTrue(source.contains(".accessibilityLabel(\"Add GIF or photo\")"))
+        XCTAssertTrue(source.contains(".layoutPriority(1)"))
+        XCTAssertFalse(source.contains(".frame(width: 58, height: inputHeight)"))
+    }
+
+    func testOptimisticFollowUpGroupsAcrossLocalIdentityAliases() {
+        let first = ChatMessage(
+            id: "confirmed-first",
+            userId: "local@example.com#socket-session",
+            displayName: "Local",
+            content: "first",
+            timestamp: Date(timeIntervalSince1970: 1_000)
+        )
+        let optimisticFollowUp = ChatMessage(
+            id: "optimistic-second",
+            userId: "local@example.com",
+            displayName: "Local",
+            content: "second",
+            timestamp: Date(timeIntervalSince1970: 1_001)
+        )
+
+        XCTAssertFalse(ChatGroupingPolicy.grouped(
+            message: optimisticFollowUp,
+            previous: first
+        ))
+        XCTAssertTrue(ChatGroupingPolicy.grouped(
+            message: optimisticFollowUp,
+            previous: first,
+            sameLocalSender: true
+        ))
     }
 
     func testChatSuggestionsUseBoundedPopoverHeightWithoutMovingComposer() throws {
@@ -8911,14 +9104,14 @@ final class ConclaveTests: XCTestCase {
         XCTAssertTrue(source.contains("private val screenShareOutgoingEmergencyBps = 280_000.0"))
         XCTAssertTrue(source.contains("private fun deriveScreenSharePublishQuality("))
         XCTAssertTrue(source.contains("screenSharePublishQuality = screenSharePublishQuality"))
-        XCTAssertTrue(source.contains("maxWidth = 3840"))
-        XCTAssertTrue(source.contains("maxHeight = 2160"))
-        XCTAssertTrue(source.contains("maxWidth = 2560"))
-        XCTAssertTrue(source.contains("maxHeight = 1440"))
-        XCTAssertTrue(source.contains("maxWidth = 1920"))
-        XCTAssertTrue(source.contains("maxHeight = 1080"))
-        XCTAssertTrue(source.contains("maxWidth = 1280"))
-        XCTAssertTrue(source.contains("maxHeight = 720"))
+        XCTAssertTrue(source.contains("configuredScreenMaxWidth = 3_840"))
+        XCTAssertTrue(source.contains("configuredScreenMaxHeight = 2_160"))
+        XCTAssertTrue(source.contains("maxWidth = minOf(configuredScreenMaxWidth, 2560)"))
+        XCTAssertTrue(source.contains("maxHeight = minOf(configuredScreenMaxHeight, 1440)"))
+        XCTAssertTrue(source.contains("maxWidth = minOf(configuredScreenMaxWidth, 1920)"))
+        XCTAssertTrue(source.contains("maxHeight = minOf(configuredScreenMaxHeight, 1080)"))
+        XCTAssertTrue(source.contains("maxWidth = minOf(configuredScreenMaxWidth, 1280)"))
+        XCTAssertTrue(source.contains("maxHeight = minOf(configuredScreenMaxHeight, 720)"))
         XCTAssertTrue(source.contains("private fun screenShareCaptureProfile("))
         XCTAssertTrue(source.contains("sourceWidth.toDouble() / cap.maxWidth.toDouble()"))
         XCTAssertTrue(source.contains("sourceHeight.toDouble() / cap.maxHeight.toDouble()"))
@@ -8939,7 +9132,7 @@ final class ConclaveTests: XCTestCase {
         XCTAssertTrue(viewModelSource.contains("screenShareSampledQuality: sample.screenSharePublishQuality"))
         XCTAssertTrue(viewModelSource.contains("self.screenSharePublishConnectionQuality == quality"))
         XCTAssertTrue(viewModelSource.contains("initialReceiveConnectionQuality: receiveConnectionQuality"))
-        XCTAssertTrue(iosWebRTCSource.contains("ScreenCaptureManager.shared.updateMaxFrameRate(\n                screenShareEncodingCap(connectionQuality: connectionQuality).maxFramerate"))
+        XCTAssertTrue(iosWebRTCSource.contains("ScreenCaptureManager.shared.updatePublishProfile(\n            maxFrameRate: cap.maxFramerate"))
         XCTAssertTrue(iosWebRTCSource.contains("private func initialScreenConsumerPreference(\n        connectionQuality: ConnectionQuality"))
         XCTAssertTrue(iosWebRTCSource.contains("initialReceiveConnectionQuality: ConnectionQuality = .unknown"))
         XCTAssertTrue(iosWebRTCSource.contains("initialScreenConsumerPreference(\n                connectionQuality: initialReceiveConnectionQuality"))
@@ -8947,6 +9140,26 @@ final class ConclaveTests: XCTestCase {
         XCTAssertTrue(androidWebRTCSource.contains("private fun initialScreenConsumerPreference(\n        connectionQuality: ConnectionQuality,"))
         XCTAssertTrue(androidWebRTCSource.contains("initialReceiveConnectionQuality: ConnectionQuality = ConnectionQuality.unknown"))
         XCTAssertTrue(androidWebRTCSource.contains("initialScreenConsumerPreference(\n                connectionQuality = initialReceiveConnectionQuality,"))
+    }
+
+    func testIOSProducerCreationDoesNotSynchronouslyReapplySenderParameters() throws {
+        let source = try sourceFileContents("Sources/Conclave/Core/WebRTC/WebRTCClient.swift")
+
+        let cameraStart = try XCTUnwrap(source.range(of: "localVideoTrack = trackWrapper"))
+        let cameraEnd = try XCTUnwrap(source.range(
+            of: "debugLog(\"[WebRTC] Video producer created:",
+            range: cameraStart.upperBound..<source.endIndex
+        ))
+        let cameraCompletion = source[cameraStart.lowerBound..<cameraEnd.lowerBound]
+        XCTAssertFalse(cameraCompletion.contains("applyLocalBandwidthProfile"))
+
+        let screenStart = try XCTUnwrap(source.range(of: "screenProducer = producer"))
+        let screenEnd = try XCTUnwrap(source.range(
+            of: "debugLog(\"[WebRTC] Screen sharing producer created:",
+            range: screenStart.upperBound..<source.endIndex
+        ))
+        let screenCompletion = source[screenStart.lowerBound..<screenEnd.lowerBound]
+        XCTAssertFalse(screenCompletion.contains("applyLocalBandwidthProfile"))
     }
 
     func testNativeRemoteConsumersStageBeforeResumeAndExposeOnlyAfterAcknowledgement() throws {
@@ -9564,8 +9777,8 @@ final class ConclaveTests: XCTestCase {
         ))
         XCTAssertFalse(iosHandoff.contains("startCameraCapture"))
         XCTAssertFalse(iosHandoff.contains("createVideoTrack"))
-        XCTAssertTrue(iosSource.contains("encoding.maxBitrateBps = NSNumber(value: 1_650_000)"))
-        XCTAssertTrue(iosSource.contains("encoding.maxFramerate = NSNumber(value: 30.0)"))
+        XCTAssertTrue(iosSource.contains("encoding.maxBitrateBps = NSNumber(value: configuredCameraMaxBitrateBps)"))
+        XCTAssertTrue(iosSource.contains("encoding.maxFramerate = NSNumber(value: Double(configuredCameraFrameRate))"))
         XCTAssertTrue(iosSource.contains("WebcamEncodingSpec(rid: \"q\", scaleResolutionDownBy: 4, maxBitrateBps: 80_000"))
         XCTAssertTrue(iosSource.contains("WebcamEncodingSpec(rid: \"h\", scaleResolutionDownBy: 2, maxBitrateBps: 220_000"))
         XCTAssertTrue(iosSource.contains("WebcamEncodingSpec(rid: \"f\", scaleResolutionDownBy: 1, maxBitrateBps: 1_650_000, maxFramerate: 30)"))
@@ -9606,8 +9819,8 @@ final class ConclaveTests: XCTestCase {
         XCTAssertFalse(androidHandoff.contains("createVideoTrack"))
         XCTAssertFalse(androidHandoff.contains("startCapture"))
         XCTAssertTrue(androidSource.contains("RtpParameters.Encoding(null, true, 1.0)"))
-        XCTAssertTrue(androidSource.contains("encoding.maxBitrateBps = 1_650_000"))
-        XCTAssertTrue(androidSource.contains("encoding.maxFramerate = 30"))
+        XCTAssertTrue(androidSource.contains("encoding.maxBitrateBps = configuredCameraMaxBitrateBps"))
+        XCTAssertTrue(androidSource.contains("encoding.maxFramerate = configuredCameraFrameRate"))
         XCTAssertTrue(androidSource.contains("WebcamEncodingSpec(rid = \"q\", scaleResolutionDownBy = 4.0, maxBitrateBps = 80_000"))
         XCTAssertTrue(androidSource.contains("WebcamEncodingSpec(rid = \"h\", scaleResolutionDownBy = 2.0, maxBitrateBps = 220_000"))
         XCTAssertTrue(androidSource.contains("WebcamEncodingSpec(rid = \"f\", scaleResolutionDownBy = 1.0, maxBitrateBps = 1_650_000, maxFramerate = 30)"))

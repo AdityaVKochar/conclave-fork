@@ -51,8 +51,26 @@ struct TranscriptPanelView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var navigation = TranscriptPanelNavigationState()
     @State private var copyState = 0
+    #if !SKIP
+    @State private var selectedPresentationDetent: PresentationDetent = .fraction(MeetingSheetView.detentFraction)
+    #endif
+
+    static let runningDetentFraction: CGFloat = 0.72
 
     private var state: TranscriptState { viewModel.transcriptState }
+    #if !SKIP
+    private var presentationDetents: Set<PresentationDetent> {
+        guard state.isRunning else {
+            return [.fraction(MeetingSheetView.detentFraction)]
+        }
+
+        return [
+            .fraction(MeetingSheetView.detentFraction),
+            .fraction(Self.runningDetentFraction),
+            .large
+        ]
+    }
+    #endif
 
     var body: some View {
         VStack(spacing: 0) {
@@ -89,6 +107,14 @@ struct TranscriptPanelView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .acmColorBackground(ACMColors.surface)
+        .preferredColorScheme(.dark)
+        .tint(ACMColors.primaryOrange)
+        #if !SKIP
+        // Keep setup at the regular meeting-sheet height. Once live, start tall
+        // and let the user resize between standard, tall, and full-height stops.
+        .presentationDetents(presentationDetents, selection: $selectedPresentationDetent)
+        .presentationDragIndicator(.visible)
+        #endif
         .onAppear {
             viewModel.openTranscriptStream()
         }
@@ -98,6 +124,11 @@ struct TranscriptPanelView: View {
             }
         }
         .onChange(of: state.sessionStatus) {
+            #if !SKIP
+            selectedPresentationDetent = state.isRunning
+                ? .fraction(Self.runningDetentFraction)
+                : .fraction(MeetingSheetView.detentFraction)
+            #endif
             if !state.isRunning {
                 navigation.select(.transcript)
             }
@@ -158,51 +189,11 @@ private struct TranscriptPanelHeader: View {
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            HStack(alignment: .top, spacing: ACMSpacing.sm) {
-                VStack(alignment: .leading, spacing: 2) {
-                    HStack(spacing: 8) {
-                        Text("Transcript")
-                            .font(ACMFont.trial(15, weight: .semibold))
-                            .foregroundStyle(ACMColors.text)
+        VStack(alignment: .leading, spacing: 0) {
+            titleRow
 
-                        Text("BETA")
-                            .font(ACMFont.trial(9.5, weight: .semibold))
-                            .foregroundStyle(ACMColors.primaryOrange)
-                            .padding(.horizontal, 6)
-                            .padding(.vertical, 2.5)
-                            .acmColorBackground(ACMColors.primaryOrange.opacity(0.10))
-                            .overlay {
-                                RoundedRectangle(cornerRadius: 6)
-                                    .strokeBorder(ACMColors.primaryOrange.opacity(0.30), lineWidth: 1)
-                            }
-                            .clipShape(RoundedRectangle(cornerRadius: 6))
-                    }
-
-                    if state.isRunning, let controller = state.controllerName, !controller.isEmpty {
-                        Text("Hosted by \(controller)")
-                            .font(ACMFont.trial(11.5))
-                            .foregroundStyle(ACMColors.textMuted)
-                            .lineLimit(1)
-                    } else if state.capabilitiesKnown && !state.canStart && !state.canTakeover {
-                        Text("View only")
-                            .font(ACMFont.trial(11.5))
-                            .foregroundStyle(ACMColors.textMuted)
-                    }
-                }
-
-                Spacer(minLength: 0)
-
-                Button(action: onClose) {
-                    ACMSystemIcon.icon("xmark", android: "close", size: 17, tint: "muted")
-                        .foregroundStyle(ACMColors.textMuted)
-                        .frame(width: 34, height: 34)
-                        .acmColorBackground(ACMColors.subtleFill)
-                        .clipShape(RoundedRectangle(cornerRadius: ACMRadius.sm))
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel("Close transcript")
-            }
+            sessionAttribution
+                .padding(.top, 7)
 
             if state.isRunning {
                 HStack(spacing: 8) {
@@ -233,12 +224,60 @@ private struct TranscriptPanelHeader: View {
                         .accessibilityLabel("Show \(tab.label.lowercased())")
                     }
                 }
-                .padding(.top, 10)
+                .padding(.top, 15)
             }
         }
         .padding(.horizontal, ACMSpacing.md)
-        .padding(.top, ACMSpacing.sm)
-        .padding(.bottom, ACMSpacing.sm)
+        .padding(.top, 14)
+        .padding(.bottom, 14)
+    }
+
+    private var titleRow: some View {
+        HStack(alignment: .center, spacing: ACMSpacing.md) {
+            HStack(spacing: 9) {
+                Text("Transcript")
+                    .font(ACMFont.trial(16, weight: .semibold))
+                    .foregroundStyle(ACMColors.text)
+
+                Text("BETA")
+                    .font(ACMFont.trial(9.5, weight: .semibold))
+                    .foregroundStyle(ACMColors.primaryOrange)
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 3)
+                    .acmColorBackground(ACMColors.primaryOrange.opacity(0.10))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 6)
+                            .strokeBorder(ACMColors.primaryOrange.opacity(0.30), lineWidth: 1)
+                    }
+                    .clipShape(RoundedRectangle(cornerRadius: 6))
+            }
+
+            Spacer(minLength: ACMSpacing.sm)
+
+            Button(action: onClose) {
+                ACMSystemIcon.icon("xmark", android: "close", size: 16, tint: "muted")
+                    .foregroundStyle(ACMColors.textMuted)
+                    .frame(width: 36, height: 36)
+                    .acmColorBackground(ACMColors.subtleFill)
+                    .clipShape(RoundedRectangle(cornerRadius: ACMRadius.sm))
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Close transcript")
+        }
+    }
+
+    @ViewBuilder
+    private var sessionAttribution: some View {
+        if state.isRunning, let controller = state.controllerName, !controller.isEmpty {
+            Text("Hosted by \(controller)")
+                .font(ACMFont.trial(12))
+                .foregroundStyle(ACMColors.textMuted)
+                .lineLimit(1)
+        } else if state.capabilitiesKnown && !state.canStart && !state.canTakeover {
+            Text("View only")
+                .font(ACMFont.trial(12))
+                .foregroundStyle(ACMColors.textMuted)
+        }
     }
 }
 

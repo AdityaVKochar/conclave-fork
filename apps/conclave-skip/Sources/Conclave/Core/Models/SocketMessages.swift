@@ -160,15 +160,52 @@ struct ToggleMediaRequest: Codable {
 struct SendChatRequest: Codable {
     let content: String
     let gif: ChatGifAttachment?
+    let image: ChatImageAttachment?
     // The SFU also resolves DMs from "/dm <name>" and "@<name>" content.
     let recipient: String?
     let replyTo: ChatReplyPreview?
 
-    init(content: String, gif: ChatGifAttachment? = nil, recipient: String? = nil, replyTo: ChatReplyPreview? = nil) {
+    init(
+        content: String,
+        gif: ChatGifAttachment? = nil,
+        image: ChatImageAttachment? = nil,
+        recipient: String? = nil,
+        replyTo: ChatReplyPreview? = nil
+    ) {
         self.content = content
         self.gif = gif
+        self.image = image
         self.recipient = recipient
         self.replyTo = replyTo
+    }
+}
+
+/// Ack payload of `chat:imageUploadAuthorize` (meeting-core): a short-lived
+/// bearer token plus the asset endpoint to POST the raw image bytes to.
+struct ChatImageUploadAuthorization: Codable {
+    let token: String
+    let uploadUrl: String
+    let maxBytes: Int
+}
+
+/// Raw `chat:imageUploadAuthorize` ack. The server answers EITHER the grant
+/// fields or `{error}` (rate limit, host policy, watch-only); decoding through
+/// this and calling `authorization()` surfaces the server's message instead of
+/// a generic connection error.
+struct ChatImageUploadAuthorizationAck: Codable {
+    let token: String?
+    let uploadUrl: String?
+    let maxBytes: Int?
+    let error: String?
+
+    func authorization() throws -> ChatImageUploadAuthorization {
+        if let error, !error.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            throw ChatImageUploadError(message: error)
+        }
+        guard let token, let uploadUrl, let maxBytes else {
+            throw ChatImageUploadError(message: "Image upload is unavailable right now.")
+        }
+        return ChatImageUploadAuthorization(token: token, uploadUrl: uploadUrl, maxBytes: maxBytes)
     }
 }
 
@@ -1172,6 +1209,7 @@ struct ChatMessageNotification: Codable {
     let content: String
     let timestamp: Double
     let gif: ChatGifAttachment?
+    let image: ChatImageAttachment?
     // DM fields (meeting-core ChatMessage) - present only on direct messages.
     let isDirect: Bool?
     let dmTargetUserId: String?
@@ -1193,6 +1231,17 @@ struct ChatHistorySnapshotNotification: Codable {
     let roomId: String?
 }
 
+struct ChatMessageReaction: Codable, Equatable {
+    let emoji: String
+    let userIds: [String]
+}
+
+struct ChatReactionChangedNotification: Codable {
+    let messageId: String
+    let reactions: [ChatMessageReaction]
+    let roomId: String
+}
+
 extension ChatMessageNotification {
     var chatMessage: ChatMessage {
         chatMessage(taggedRoomId: nil)
@@ -1206,6 +1255,7 @@ extension ChatMessageNotification {
             content: content,
             timestamp: Date(timeIntervalSince1970: timestamp / 1000),
             gif: gif,
+            image: image,
             isDirect: isDirect ?? false,
             dmTargetUserId: dmTargetUserId,
             dmTargetDisplayName: dmTargetDisplayName,
@@ -1838,6 +1888,67 @@ struct WebinarParticipantJoinedNotification: Codable {
         try container.encode(userId, forKey: .userId)
         try container.encodeIfPresent(displayName, forKey: .displayName)
     }
+}
+
+enum WebinarQaStatus: String, Codable {
+    case pending
+    case answering
+    case answered
+    case dismissed
+}
+
+struct WebinarQaEntry: Codable {
+    let id: String
+    let userId: String
+    let displayName: String
+    let question: String
+    let status: WebinarQaStatus
+    let askedAt: Double
+    let updatedAt: Double
+    let upvotes: Int
+    let hasUpvoted: Bool?
+    let answerText: String?
+    let answeredByName: String?
+}
+
+struct WebinarQaSnapshot: Codable {
+    let roomId: String
+    let qaEntries: [WebinarQaEntry]
+
+    enum CodingKeys: String, CodingKey {
+        case roomId
+        // Avoid generating a Kotlin enum member named `entries`, which
+        // conflicts with Kotlin's built-in Enum.entries property.
+        case qaEntries = "entries"
+    }
+}
+
+struct WebinarQaChangedNotification: Codable {
+    let roomId: String
+    let entry: WebinarQaEntry?
+    let removedId: String?
+}
+
+struct WebinarHandQueueEntry: Codable {
+    let userId: String
+    let displayName: String
+    let raisedAt: Double
+}
+
+struct WebinarHandQueueChangedNotification: Codable {
+    let roomId: String
+    let queue: [WebinarHandQueueEntry]
+}
+
+struct WebinarPromotedNotification: Codable {
+    let roomId: String
+    let rejoinRoomId: String
+    let promotedByName: String?
+}
+
+struct WebinarDemotedNotification: Codable {
+    let roomId: String
+    let webinarLinkSlug: String?
 }
 
 struct WaitingRoomStatusNotification: Codable {

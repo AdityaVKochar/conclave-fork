@@ -1,3 +1,5 @@
+> **STALE (2026-07-14):** historical snapshot from 2026-07-01. The current kickoff prompt is `HANDOFF-PROMPT.md`; the living playbook is `AGENTS.md`. Do not work from this file.
+
 # Conclave Native (`apps/conclave-skip`) - Polish & Performance Handoff
 
 **Author:** prior agent session (2026-07-01)

@@ -49,6 +49,8 @@ final class ScreenShareSocketServer: @unchecked Sendable {
     private var listenHandle: Int32 = -1
     private var clientHandle: Int32 = -1
     private var isRunning = false
+    private var decodeMaxWidth = 3_840
+    private var decodeMaxHeight = 2_160
 
     /// Called on the read queue with each decoded frame.
     private var onFrame: (@Sendable (ScreenFrameBox) -> Void)?
@@ -171,6 +173,19 @@ final class ScreenShareSocketServer: @unchecked Sendable {
         unlink(socketPath)
     }
 
+    func updateMaxResolution(width: Int, height: Int) {
+        lock.lock()
+        decodeMaxWidth = max(320, min(width, 3_840))
+        decodeMaxHeight = max(180, min(height, 2_160))
+        lock.unlock()
+    }
+
+    private func maxResolution() -> (width: Int, height: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (decodeMaxWidth, decodeMaxHeight)
+    }
+
     /// Best-effort: connect a throwaway client to the listening socket so a
     /// blocked accept() returns.
     private func wakeAccept() {
@@ -204,45 +219,46 @@ final class ScreenShareSocketServer: @unchecked Sendable {
     // MARK: - Read loop
 
     private func acceptLoop(listenFD: Int32) {
-        let client = accept(listenFD, nil, nil)
-        if client < 0 {
-            return
-        }
-        if !running() {
-            Darwin.close(client)
-            return
-        }
+        while running() {
+            let client = accept(listenFD, nil, nil)
+            if client < 0 {
+                if running() { continue }
+                return
+            }
+            if !running() {
+                Darwin.close(client)
+                return
+            }
 
-        var noSigPipe: Int32 = 1
-        _ = withUnsafePointer(to: &noSigPipe) { pointer in
-            setsockopt(client, SOL_SOCKET, SO_NOSIGPIPE, pointer,
-                       socklen_t(MemoryLayout<Int32>.size))
-        }
+            var noSigPipe: Int32 = 1
+            _ = withUnsafePointer(to: &noSigPipe) { pointer in
+                setsockopt(client, SOL_SOCKET, SO_NOSIGPIPE, pointer,
+                           socklen_t(MemoryLayout<Int32>.size))
+            }
 
-        lock.lock()
-        clientHandle = client
-        lock.unlock()
-        message = nil
+            lock.lock()
+            clientHandle = client
+            lock.unlock()
+            message = nil
 
-        // The extension is live - let the app flip from "starting" to "sharing"
-        // and cancel its start-timeout.
-        onClientConnect?()
+            // A reconnect is equivalent to the initial connection to callers;
+            // they can cancel their grace timer and keep the producer alive.
+            onClientConnect?()
 
-        readLoop(client)
+            readLoop(client)
 
-        lock.lock()
-        let stillRunning = isRunning
-        if clientHandle == client {
-            Darwin.close(client)
-            clientHandle = -1
-        }
-        lock.unlock()
-        message = nil
+            lock.lock()
+            let stillRunning = isRunning
+            if clientHandle == client {
+                Darwin.close(client)
+                clientHandle = -1
+            }
+            lock.unlock()
+            message = nil
 
-        // Distinguish an app-initiated stop (isRunning already false) from the
-        // extension closing the connection (broadcast ended externally).
-        if stillRunning {
-            onClientDisconnect?()
+            if stillRunning {
+                onClientDisconnect?()
+            }
         }
     }
 
@@ -257,9 +273,13 @@ final class ScreenShareSocketServer: @unchecked Sendable {
                 // 0 = orderly shutdown (extension closed), <0 = error/interrupt.
                 return
             }
-            buffer.withUnsafeBytes { ptr in
-                if let base = ptr.baseAddress {
-                    appendBytes(base.assumingMemoryBound(to: UInt8.self), count: n)
+            // ImageIO/CoreGraphics bridge objects can otherwise accumulate in
+            // the long-lived global dispatch worker's autorelease pool.
+            autoreleasepool {
+                buffer.withUnsafeBytes { ptr in
+                    if let base = ptr.baseAddress {
+                        appendBytes(base.assumingMemoryBound(to: UInt8.self), count: n)
+                    }
                 }
             }
         }
@@ -331,7 +351,12 @@ final class ScreenShareSocketServer: @unchecked Sendable {
     // MARK: - Decode → RTCVideoFrame
 
     private func emitFrame(jpeg: Data, width: Int, height: Int, orientation: Int) {
-        guard let pixelBuffer = Self.pixelBuffer(fromJPEG: jpeg) else {
+        let resolution = maxResolution()
+        guard let pixelBuffer = Self.pixelBuffer(
+            fromJPEG: jpeg,
+            maxWidth: resolution.width,
+            maxHeight: resolution.height
+        ) else {
             // Device-only feature with no CI coverage - a silent decode failure
             // leaves a black/frozen share undebuggable. Throttled to ~1/s.
             let now = Date().timeIntervalSince1970
@@ -369,15 +394,26 @@ final class ScreenShareSocketServer: @unchecked Sendable {
         }
     }
 
-    private static func pixelBuffer(fromJPEG data: Data) -> CVPixelBuffer? {
+    private static func pixelBuffer(
+        fromJPEG data: Data,
+        maxWidth: Int,
+        maxHeight: Int
+    ) -> CVPixelBuffer? {
         guard let source = CGImageSourceCreateWithData(data as CFData, nil),
               let cgImage = CGImageSourceCreateImageAtIndex(source, 0, nil)
         else {
             return nil
         }
-        let width = cgImage.width
-        let height = cgImage.height
-        if width <= 0 || height <= 0 { return nil }
+        let sourceWidth = cgImage.width
+        let sourceHeight = cgImage.height
+        if sourceWidth <= 0 || sourceHeight <= 0 { return nil }
+        let scale = max(
+            1.0,
+            Double(sourceWidth) / Double(max(1, maxWidth)),
+            Double(sourceHeight) / Double(max(1, maxHeight))
+        )
+        let width = evenDimension(Int((Double(sourceWidth) / scale).rounded(.down)))
+        let height = evenDimension(Int((Double(sourceHeight) / scale).rounded(.down)))
 
         let attrs: [CFString: Any] = [
             kCVPixelBufferCGImageCompatibilityKey: true,
@@ -407,6 +443,11 @@ final class ScreenShareSocketServer: @unchecked Sendable {
         }
         context.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
         return pb
+    }
+
+    private static func evenDimension(_ value: Int) -> Int {
+        let dimension = max(2, value)
+        return dimension % 2 == 0 ? dimension : dimension - 1
     }
 }
 #endif

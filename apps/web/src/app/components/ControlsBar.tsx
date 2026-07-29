@@ -667,6 +667,7 @@ function ControlsBar(props: ControlsBarProps) {
     onToggleNoiseCancellation,
     isMirrorCamera,
     onToggleMirror,
+    onToggleDeviceSettings,
   } = props;
   const hasAudioDevicePicker = Boolean(
     onAudioInputDeviceChange ||
@@ -679,8 +680,9 @@ function ControlsBar(props: ControlsBarProps) {
 
   const [reactionsOpen, setReactionsOpen] = useState(false);
   const [moreOpen, setMoreOpen] = useState(false);
-  // Settings is its own drawer, opened from a tile in the More drawer (devices,
-  // flip camera, mirror).
+  // Fallback compact settings drawer. The meeting surface normally supplies
+  // the full settings panel so camera/screen quality controls stay identical
+  // across desktop and mobile web.
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [browserOpen, setBrowserOpen] = useState(false);
   const [browserUrl, setBrowserUrl] = useState("");
@@ -888,7 +890,6 @@ function ControlsBar(props: ControlsBarProps) {
             label: "Host controls",
             showTooltipWithoutHotkey: true,
             variant: isHostControlsOpen ? "active" : "default",
-            badge: props.pendingUsersCount,
             onPress: onToggleHostControls,
           },
         }
@@ -1140,7 +1141,9 @@ function ControlsBar(props: ControlsBarProps) {
                           }}
                         />
                       )}
-                      {(hasAudioDevicePicker || hasVideoDevicePicker) && (
+                      {(hasAudioDevicePicker ||
+                        hasVideoDevicePicker ||
+                        onToggleDeviceSettings) && (
                           <MoreTile
                             row={{
                               id: "settings",
@@ -1149,7 +1152,11 @@ function ControlsBar(props: ControlsBarProps) {
                             }}
                             onActivate={() => {
                               setMoreOpen(false);
-                              setSettingsOpen(true);
+                              if (onToggleDeviceSettings) {
+                                onToggleDeviceSettings();
+                              } else {
+                                setSettingsOpen(true);
+                              }
                             }}
                           />
                         )}

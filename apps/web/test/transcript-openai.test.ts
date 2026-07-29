@@ -74,16 +74,16 @@ describe("transcript OpenAI request helpers", () => {
     expect(url.searchParams.has("model")).toBe(false);
   });
 
-  it("sends delay only for gpt-realtime-whisper", () => {
+  it("sends delay only for gpt-live-transcribe", () => {
     expect(
       buildRealtimeTranscriptionConfig({
-        model: "gpt-realtime-whisper",
+        model: "gpt-live-transcribe",
         language: "en",
         delay: "medium",
         locale: "en-IN",
       }),
     ).toEqual({
-      model: "gpt-realtime-whisper",
+      model: "gpt-live-transcribe",
       language: "en",
       delay: "medium",
     });
@@ -98,7 +98,7 @@ describe("transcript OpenAI request helpers", () => {
         locale: "en-IN",
       }),
     ).toEqual({
-      model: "gpt-realtime-whisper",
+      model: "gpt-live-transcribe",
       language: "en",
       delay: "medium",
     });

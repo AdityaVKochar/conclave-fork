@@ -113,8 +113,14 @@ export default function MeetingEnterOverlay({
           key="meeting-enter-overlay"
           className="fixed inset-0 z-[200] overflow-hidden bg-black"
           initial={{ opacity: 0 }}
-          animate={{ opacity: 1 }}
-          exit={{ opacity: 0 }}
+          animate={{ opacity: 1, pointerEvents: "auto" }}
+          // Non-animatable values apply the instant the exit starts. That
+          // matters: the fade runs on rAF, which browsers freeze in
+          // backgrounded tabs — AnimatePresence then holds this full-screen
+          // layer mounted at opacity 0, and without the immediate
+          // pointer-events cut it silently eats every click on the meeting
+          // UI underneath.
+          exit={{ opacity: 0, pointerEvents: "none" }}
           transition={{ duration: 0.42, ease: EASE }}
         >
           <motion.div

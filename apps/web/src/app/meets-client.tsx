@@ -109,6 +109,7 @@ import {
   getBrowserNetworkSnapshot,
 } from "./lib/network-information";
 import { hasBlockingPublishRecoveryTelemetry } from "./lib/connection-quality-policy";
+import { resolveEffectiveCameraPublishSettings } from "./lib/media-quality-settings";
 import {
   generateRoomCode,
   isSystemUserId,
@@ -390,6 +391,8 @@ export type MeetsClientProps = {
   joinMode?: JoinMode;
   autoJoinOnMount?: boolean;
   hideJoinUI?: boolean;
+  /** Public webinar title shown in the attendee viewer chrome. */
+  webinarTitle?: string;
   getRooms?: () => Promise<RoomInfo[]>;
   getRoom?: (roomId: string) => Promise<RoomInfo | null>;
   reactionAssets?: string[];
@@ -406,6 +409,7 @@ export default function MeetsClient({
   joinMode = "meeting",
   autoJoinOnMount = false,
   hideJoinUI = false,
+  webinarTitle,
   getRooms,
   getRoom,
   reactionAssets,
@@ -593,6 +597,14 @@ export default function MeetsClient({
     setWebinarLink,
     webinarSpeakerUserId,
     setWebinarSpeakerUserId,
+    webinarQaEntries,
+    setWebinarQaEntries,
+    webinarHandQueue,
+    setWebinarHandQueue,
+    isWebinarHandRaised,
+    setIsWebinarHandRaised,
+    webinarStageInvite,
+    setWebinarStageInvite,
     serverRestartNotice,
     setServerRestartNotice,
     adminNotice,
@@ -929,6 +941,9 @@ export default function MeetsClient({
 
   const {
     setNetworkManagedVideoQuality,
+    mediaQualitySettings,
+    mediaQualitySettingsRef,
+    setMediaQualitySettings,
     isMirrorCamera,
     setIsMirrorCamera,
     selectedAudioInputDeviceId,
@@ -946,11 +961,21 @@ export default function MeetsClient({
       connectionState === "disconnected" || connectionState === "waiting",
   });
 
+  const cameraPublishSettings = useMemo(
+    () =>
+      resolveEffectiveCameraPublishSettings(
+        mediaQualitySettings.camera,
+        activeVideoEffectsCount > 0,
+      ),
+    [activeVideoEffectsCount, mediaQualitySettings.camera],
+  );
+
   // Local-only camera preview for the Settings/effects panels: acquired with a
   // plain getUserMedia and never attached to a producer, so nothing reaches
   // the room while the real camera stays off.
   const cameraPreview = useLocalCameraPreview({
     deviceId: selectedVideoInputDeviceId,
+    publishSettings: cameraPublishSettings,
   });
   const stopCameraPreview = cameraPreview.stop;
   const localStreamHasLiveVideo = hasLiveVideoTrack(localStream);
@@ -1104,6 +1129,7 @@ export default function MeetsClient({
     replyTarget,
     startReply,
     cancelReply,
+    toggleMessageReaction,
     assistantApiKeyPrompt,
     submitAssistantApiKey,
     cancelAssistantApiKeyPrompt,
@@ -1184,6 +1210,7 @@ export default function MeetsClient({
     setIsMuted,
     isCameraOff,
     setIsCameraOff,
+    cameraDisabled: viewSettings.audioOnlyMode,
     isScreenSharing,
     setIsScreenSharing,
     activeScreenShareId,
@@ -1199,6 +1226,8 @@ export default function MeetsClient({
     isNoiseCancellationEnabled,
     meetVolume,
     videoQualityRef: refs.videoQualityRef,
+    mediaQualitySettings,
+    mediaQualitySettingsRef,
     webcamCodecPolicyRef: refs.webcamCodecPolicyRef,
     dataSaverMode: effectiveDataSaverMode,
     activeVideoEffectsCount,
@@ -2245,6 +2274,28 @@ export default function MeetsClient({
     }
   }, [setMeetError, setRoomId, setWaitingMessage]);
 
+  const webinarConfigRef = useRef(webinarConfig);
+  webinarConfigRef.current = webinarConfig;
+
+  // Host moved this promoted speaker back to the audience: a full navigation
+  // to the public webinar page tears down all publish state and rejoins as a
+  // view-only attendee.
+  const handleWebinarDemoted = useCallback(
+    (notification: { webinarLinkSlug?: string | null }) => {
+      if (typeof window === "undefined") return;
+      const slug =
+        notification.webinarLinkSlug?.trim() ||
+        webinarConfigRef.current?.linkSlug?.trim() ||
+        "";
+      if (slug) {
+        window.location.assign(`/w/${encodeURIComponent(slug)}`);
+      } else {
+        window.location.assign("/");
+      }
+    },
+    [],
+  );
+
   const socket = useMeetSocket({
     refs,
     roomId,
@@ -2278,6 +2329,11 @@ export default function MeetsClient({
     setWebinarConfig,
     setWebinarRole,
     setWebinarSpeakerUserId,
+    setWebinarQaEntries,
+    setWebinarHandQueue,
+    setIsWebinarHandRaised,
+    setWebinarStageInvite,
+    onWebinarDemoted: handleWebinarDemoted,
     isMuted,
     setIsMuted,
     isCameraOff,
@@ -2298,8 +2354,11 @@ export default function MeetsClient({
     setServerActiveSpeakerAvailable,
     setNetworkManagedVideoQuality,
     videoQualityRef: refs.videoQualityRef,
+    mediaQualitySettingsRef,
+    activeVideoEffectsCount,
     connectionQualityRef: connectionQualityDebugRef,
     dataSaverMode: effectiveDataSaverMode,
+    audioOnlyMode: viewSettings.audioOnlyMode,
     isDocumentVisible,
     updateVideoQualityRef,
     requestMediaPermissions,
@@ -2324,6 +2383,35 @@ export default function MeetsClient({
     onLocalRoomEnded: handleLocalRoomEnded,
     bypassMediaPermissions,
   });
+
+  // Accepting a stage invite rejoins the same room as a full participant via
+  // navigation: the join screen doubles as the mic/camera prejoin, and the
+  // server-side promotion registry waves this identity through the gates.
+  const handleAcceptWebinarStageInvite = useCallback(() => {
+    if (!webinarStageInvite || typeof window === "undefined") return;
+    window.location.assign(
+      `/${encodeURIComponent(webinarStageInvite.rejoinRoomId)}`,
+    );
+  }, [webinarStageInvite]);
+
+  const declineWebinarStageInvite = socket.declineWebinarStageInvite;
+  const handleDismissWebinarStageInvite = useCallback(() => {
+    setWebinarStageInvite(null);
+    // Declining releases the server-side invite, so "Not now" does not leave
+    // a standing gate bypass attached to this identity.
+    declineWebinarStageInvite();
+  }, [setWebinarStageInvite, declineWebinarStageInvite]);
+
+  useEffect(() => {
+    if (viewSettings.audioOnlyMode && !isCameraOff) void toggleCamera();
+    if (viewSettings.audioOnlyMode && isScreenSharing) void toggleScreenShare();
+  }, [
+    isCameraOff,
+    isScreenSharing,
+    toggleCamera,
+    toggleScreenShare,
+    viewSettings.audioOnlyMode,
+  ]);
 
   useEffect(() => {
     ensureProducerTransportRef.current = socket.ensureProducerTransport;
@@ -2566,6 +2654,7 @@ export default function MeetsClient({
     const targetRoomId = generateRoomCode();
     handleStopVoiceAgent();
     socket.cleanup();
+    setViewSettings((settings) => ({ ...settings, audioOnlyMode: false }));
     setMeetError(null);
     setMeetingEndedNotice(null);
     setWaitingMessage(null);
@@ -2596,6 +2685,7 @@ export default function MeetsClient({
     playNotificationSoundForEvents("leave");
     shouldResetMeetingSurfaceOnDisconnectRef.current = true;
     socket.cleanup();
+    setViewSettings((settings) => ({ ...settings, audioOnlyMode: false }));
     setIsCameraOff(true);
     setIsMuted(true);
   }, [
@@ -2984,6 +3074,9 @@ export default function MeetsClient({
     screenProducerRef: refs.screenProducerRef,
     screenAudioProducerRef: refs.screenAudioProducerRef,
     videoQualityRef: refs.videoQualityRef,
+    localStreamRef: refs.localStreamRef,
+    mediaQualitySettingsRef,
+    activeVideoEffectsCount,
     networkManagedVideoQualityRef,
     setVideoQuality: setNetworkManagedVideoQuality,
     updateVideoQualityRef,
@@ -3317,6 +3410,8 @@ export default function MeetsClient({
         isMirrorCamera={isMirrorCamera}
         mirrorLocalPreview={mirrorLocalPreview}
         onToggleMirror={() => setIsMirrorCamera((prev) => !prev)}
+        mediaQualitySettings={mediaQualitySettings}
+        onMediaQualitySettingsChange={setMediaQualitySettings}
         selectedAudioInputDeviceId={selectedAudioInputDeviceId}
         selectedAudioOutputDeviceId={selectedAudioOutputDeviceId}
         ttsSystemVoices={availableSystemVoices}
@@ -3373,6 +3468,9 @@ export default function MeetsClient({
         setChatOverlayMessages={setChatOverlayMessages}
         replyTarget={replyTarget}
         onReplyToMessage={startReply}
+        onToggleMessageReaction={
+          isWebinarAttendee ? undefined : toggleMessageReaction
+        }
         onCancelReply={cancelReply}
         activeTtsMessageId={activeTtsMessageId}
         onReplayTtsMessage={handleReplayTtsMessage}
@@ -3442,6 +3540,31 @@ export default function MeetsClient({
         webinarRole={webinarRole}
         webinarSpeakerUserId={webinarSpeakerUserId}
         webinarLink={webinarLink}
+        webinarTitle={webinarTitle}
+        webinarQaEntries={webinarQaEntries}
+        webinarHandQueue={webinarHandQueue}
+        isWebinarHandRaised={isWebinarHandRaised}
+        webinarStageInvite={webinarStageInvite}
+        onDismissWebinarStageInvite={handleDismissWebinarStageInvite}
+        onAcceptWebinarStageInvite={handleAcceptWebinarStageInvite}
+        onSubmitWebinarQuestion={
+          isWebinarAttendee ? socket.submitWebinarQuestion : undefined
+        }
+        onUpvoteWebinarQuestion={
+          isWebinarAttendee ? socket.upvoteWebinarQuestion : undefined
+        }
+        onModerateWebinarQuestion={
+          canModerateMeeting ? socket.moderateWebinarQuestion : undefined
+        }
+        onSetWebinarHandRaised={
+          isWebinarAttendee ? socket.setWebinarHandRaisedRemote : undefined
+        }
+        onPromoteWebinarAttendee={
+          canModerateMeeting ? socket.promoteWebinarAttendee : undefined
+        }
+        onDemoteWebinarParticipant={
+          canModerateMeeting ? socket.demoteWebinarParticipant : undefined
+        }
         onSetWebinarLink={setWebinarLink}
         onGetMeetingConfig={
           canModerateMeeting ? socket.getMeetingConfig : undefined

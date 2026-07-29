@@ -64,6 +64,33 @@ describe("buildPaletteActions", () => {
     expect(share?.disabled).toBe(true);
   });
 
+  it("disables new video publishing in audio-only mode", () => {
+    const actions = buildPaletteActions(
+      baseProps({ isAudioOnly: true }),
+      noDevices,
+    );
+    const camera = actions.find((action) => action.id === "camera");
+    const share = actions.find((action) => action.id === "screen-share");
+
+    expect(camera?.disabled).toBe(true);
+    expect(share?.disabled).toBe(true);
+  });
+
+  it("still allows an active screen share to be stopped in audio-only mode", () => {
+    const actions = buildPaletteActions(
+      baseProps({
+        isAudioOnly: true,
+        isScreenSharing: true,
+        activeScreenShareId: "local-screen",
+      }),
+      noDevices,
+    );
+    const share = actions.find((action) => action.id === "screen-share");
+
+    expect(share?.disabled).not.toBe(true);
+    expect(share?.label).toBe("Stop sharing");
+  });
+
   it("only offers panel toggles whose handlers exist", () => {
     const without = buildPaletteActions(baseProps(), noDevices);
     expect(ids(without)).not.toContain("participants");

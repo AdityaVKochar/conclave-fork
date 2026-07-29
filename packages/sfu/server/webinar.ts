@@ -56,7 +56,7 @@ const createDefaultWebinarRoomConfig = (): WebinarRoomConfig => ({
   forcedHostEmails: new Set<string>(),
   scheduledWebinarId: null,
   waitingRoomEnabled: false,
-  qaEnabled: false,
+  qaEnabled: true,
 });
 
 export const getOrCreateWebinarRoomConfig = (
@@ -343,6 +343,14 @@ export const updateWebinarRoomConfig = (
     }
   }
 
+  if (
+    typeof update.qaEnabled === "boolean" &&
+    webinarConfig.qaEnabled !== update.qaEnabled
+  ) {
+    webinarConfig.qaEnabled = update.qaEnabled;
+    changed = true;
+  }
+
   return { changed, linkVersionBumped };
 };
 
@@ -358,6 +366,7 @@ export const toWebinarConfigSnapshot = (
   requiresInviteCode: Boolean(webinarConfig.inviteCodeHash),
   linkSlug: webinarConfig.linkSlug,
   feedMode: webinarConfig.feedMode,
+  qaEnabled: webinarConfig.qaEnabled,
 });
 
 export const getWebinarBaseUrl = (): string => {

@@ -143,7 +143,8 @@ final class SocketIOManager {
     func toggleCamera(producerId: String, paused: Bool) async throws { fatalError() }
     func closeProducer(producerId: String) async throws { fatalError() }
 
-    func sendChat(content: String, gif: ChatGifAttachment? = nil, recipient: String? = nil, replyTo: ChatReplyPreview? = nil) async throws -> ChatMessage { fatalError() }
+    func sendChat(content: String, gif: ChatGifAttachment? = nil, image: ChatImageAttachment? = nil, recipient: String? = nil, replyTo: ChatReplyPreview? = nil) async throws -> ChatMessage { fatalError() }
+    func authorizeChatImageUpload() async throws -> ChatImageUploadAuthorization { fatalError() }
     func requestConclaveAuthorization(answerId: String, questionMessageId: String) async throws -> ConclaveAuthorizeResponse { fatalError() }
     func relayConclaveAnswer(_ packet: ConclaveAssistantRelayPacket) { fatalError() }
     func sendReaction(emoji: String?, kind: String?, value: String?, label: String?) async throws { fatalError() }

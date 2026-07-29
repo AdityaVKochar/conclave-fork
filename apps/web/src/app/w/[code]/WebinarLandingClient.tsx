@@ -1,8 +1,48 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import { CalendarPlus, Check, Copy } from "lucide-react";
+import { ArrowRight, CalendarPlus, Check, Copy } from "lucide-react";
+import { useSession } from "@/lib/auth-client";
 import MeetsClientPage from "../../meets-client-page";
+
+const GUEST_USER_STORAGE_KEY = "conclave:guest-user";
+const MAX_ATTENDEE_NAME_LENGTH = 60;
+
+/** The stored guest name, or null when the viewer has never introduced themselves. */
+const readStoredGuestName = (): string | null => {
+  if (typeof window === "undefined") return null;
+  try {
+    const raw = window.localStorage.getItem(GUEST_USER_STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as { id?: unknown; name?: unknown };
+    if (typeof parsed?.id !== "string" || !parsed.id.startsWith("guest-")) {
+      return null;
+    }
+    return typeof parsed.name === "string" && parsed.name.trim()
+      ? parsed.name.trim()
+      : null;
+  } catch {
+    return null;
+  }
+};
+
+const storeGuestName = (name: string): void => {
+  if (typeof window === "undefined") return;
+  try {
+    const raw = window.localStorage.getItem(GUEST_USER_STORAGE_KEY);
+    const parsed = raw ? (JSON.parse(raw) as { id?: unknown }) : null;
+    const id =
+      parsed && typeof parsed.id === "string" && parsed.id.startsWith("guest-")
+        ? parsed.id
+        : `guest-${crypto.randomUUID()}`;
+    window.localStorage.setItem(
+      GUEST_USER_STORAGE_KEY,
+      JSON.stringify({ id, name }),
+    );
+  } catch {
+    // A blocked storage still lets them watch; they'll appear as "Guest".
+  }
+};
 
 export type PublicScheduledWebinar = {
   id: string;
@@ -108,6 +148,28 @@ export default function WebinarLandingClient({
   );
   const [now, setNow] = useState(() => Date.now());
   const [copied, setCopied] = useState(false);
+  const { data: authSession, isPending: isAuthSessionPending } = useSession();
+  const [storedGuestName, setStoredGuestName] = useState<string | null>(null);
+  const [isGuestNameReady, setIsGuestNameReady] = useState(false);
+  const [nameDraft, setNameDraft] = useState("");
+
+  useEffect(() => {
+    setStoredGuestName(readStoredGuestName());
+    setIsGuestNameReady(true);
+  }, []);
+
+  const needsAttendeeName =
+    isGuestNameReady &&
+    !isAuthSessionPending &&
+    !authSession?.user &&
+    !storedGuestName;
+
+  const handleSubmitAttendeeName = (): void => {
+    const name = nameDraft.trim().slice(0, MAX_ATTENDEE_NAME_LENGTH);
+    if (!name) return;
+    storeGuestName(name);
+    setStoredGuestName(name);
+  };
 
   useEffect(() => {
     const timer = window.setInterval(() => setNow(Date.now()), 1000);
@@ -149,6 +211,60 @@ export default function WebinarLandingClient({
   }, [webinar, now]);
 
   if (isOpen) {
+    if (!isGuestNameReady || isAuthSessionPending) {
+      return null;
+    }
+    if (needsAttendeeName) {
+      return (
+        <PageShell>
+          <StatusCard>
+            <p className="text-[11.5px] font-semibold uppercase tracking-[0.07em] text-[#fafafa]/40">
+              Live webinar
+            </p>
+            <h1
+              className="mt-3 text-[22px] leading-tight text-[#fafafa]"
+              style={{ fontFamily: "'PolySans Bulky Wide', sans-serif" }}
+            >
+              {webinar?.title ?? "Join the audience"}
+            </h1>
+            <p className="mt-2 text-[13.5px] leading-snug text-[#fafafa]/55">
+              Add your name so the host knows who&apos;s asking when you join
+              the Q&amp;A.
+            </p>
+            <form
+              className="mt-7 flex flex-col gap-2.5"
+              onSubmit={(event) => {
+                event.preventDefault();
+                handleSubmitAttendeeName();
+              }}
+            >
+              <input
+                type="text"
+                value={nameDraft}
+                onChange={(event) =>
+                  setNameDraft(
+                    event.target.value.slice(0, MAX_ATTENDEE_NAME_LENGTH),
+                  )
+                }
+                placeholder="Your name"
+                autoFocus
+                data-testid="webinar-attendee-name"
+                className="h-12 w-full rounded-xl border border-white/10 bg-white/[0.04] px-4 text-[15px] text-[#fafafa] outline-none placeholder:text-[#fafafa]/35 focus:border-[#F95F4A]/50"
+              />
+              <button
+                type="submit"
+                disabled={!nameDraft.trim()}
+                data-testid="webinar-attendee-name-submit"
+                className="inline-flex h-12 w-full items-center justify-center gap-2 rounded-xl bg-[#F95F4A] text-[15px] font-medium text-white transition-[filter] duration-150 enabled:hover:brightness-[1.05] disabled:opacity-40"
+              >
+                Start watching
+                <ArrowRight className="h-4 w-4" />
+              </button>
+            </form>
+          </StatusCard>
+        </PageShell>
+      );
+    }
     return (
       <MeetsClientPage
         initialRoomId={webinarLinkCode}
@@ -158,6 +274,7 @@ export default function WebinarLandingClient({
         joinMode="webinar_attendee"
         autoJoinOnMount={true}
         hideJoinUI={true}
+        webinarTitle={webinar?.title}
       />
     );
   }

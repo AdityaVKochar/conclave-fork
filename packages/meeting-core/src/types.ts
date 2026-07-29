@@ -59,7 +59,44 @@ export interface ChatMessage {
   ttsVoiceToken?: string;
   /** Sender dismissed the link preview; clients must not render embeds. */
   suppressEmbeds?: boolean;
+  /**
+   * Emoji reactions on this message. Server-authoritative and always sent as
+   * the complete set, so clients replace rather than merge. Absent means none.
+   */
+  reactions?: ChatMessageReaction[];
 }
+
+/**
+ * One emoji and everyone who reacted with it. User IDs (not a bare count) are
+ * on the wire so a client can render "you reacted" without extra bookkeeping,
+ * and so toggling stays idempotent across reconnects.
+ */
+export interface ChatMessageReaction {
+  emoji: string;
+  userIds: string[];
+}
+
+/**
+ * Caps the distinct emoji per message. Chat history is in-memory on the SFU,
+ * so this bounds how much a room can accumulate.
+ */
+export const MAX_REACTIONS_PER_CHAT_MESSAGE = 12;
+
+/**
+ * The canonical emoji set for both floating meeting reactions and chat message
+ * reactions. Mirrored by `allowedEmojiReactions` in the SFU (which stays
+ * dependency-free of this package) — keep the two in sync.
+ */
+export const CHAT_REACTION_EMOJIS = [
+  "👍",
+  "👏",
+  "😂",
+  "❤️",
+  "🎉",
+  "😮",
+  "😢",
+  "🤔",
+] as const;
 
 export interface SendChatMessageOptions {
   suppressEmbeds?: boolean;
@@ -141,6 +178,15 @@ export interface AdminNoticeNotification {
 export interface ChatHistorySnapshot {
   messages: ChatMessage[];
   roomId?: string;
+}
+
+/** Complete post-toggle reaction set for one chat message. Replace, don't merge. */
+export interface ChatReactionChangedNotification {
+  messageId: string;
+  reactions: ChatMessageReaction[];
+  // Always set by the server (mirrors the sfu type); clients still guard with
+  // isRoomEvent before applying, but the contract is that it is present.
+  roomId: string;
 }
 
 export type {
@@ -352,6 +398,8 @@ export interface JoinRoomResponse {
   webinarRequiresInviteCode?: boolean;
   webinarAttendeeCount?: number;
   webinarMaxAttendees?: number;
+  webinarQaEnabled?: boolean;
+  webinarSpeakerUserId?: string | null;
   webcamCodecPolicy?: WebcamCodecPolicy;
 }
 
@@ -371,6 +419,7 @@ export interface WebinarConfigSnapshot {
   requiresInviteCode: boolean;
   linkSlug?: string | null;
   feedMode: "active-speaker";
+  qaEnabled?: boolean;
 }
 
 export interface WebinarUpdateRequest {
@@ -380,6 +429,64 @@ export interface WebinarUpdateRequest {
   maxAttendees?: number;
   inviteCode?: string | null;
   linkSlug?: string | null;
+  qaEnabled?: boolean;
+}
+
+export type WebinarQaStatus = "pending" | "answering" | "answered" | "dismissed";
+
+export interface WebinarQaEntry {
+  id: string;
+  userId: string;
+  displayName: string;
+  question: string;
+  status: WebinarQaStatus;
+  askedAt: number;
+  updatedAt: number;
+  upvotes: number;
+  hasUpvoted?: boolean;
+  answerText?: string;
+  answeredByName?: string;
+}
+
+export interface WebinarQaSnapshot {
+  roomId: string;
+  entries: WebinarQaEntry[];
+}
+
+export interface WebinarQaChangedNotification {
+  roomId: string;
+  entry?: WebinarQaEntry;
+  removedId?: string;
+}
+
+export interface WebinarQaModerateRequest {
+  id: string;
+  action: "answering" | "answered" | "dismissed" | "reopen";
+  answerText?: string;
+}
+
+export interface WebinarHandQueueEntry {
+  userId: string;
+  displayName: string;
+  raisedAt: number;
+}
+
+export interface WebinarHandQueueChangedNotification {
+  roomId: string;
+  queue: WebinarHandQueueEntry[];
+}
+
+export interface WebinarPromotedNotification {
+  roomId: string;
+  /** Room id to rejoin with as a full participant. */
+  rejoinRoomId: string;
+  promotedByName?: string;
+}
+
+export interface WebinarDemotedNotification {
+  roomId: string;
+  /** Public webinar slug to rejoin with as an attendee, when known. */
+  webinarLinkSlug?: string | null;
 }
 
 export interface MeetingConfigSnapshot {

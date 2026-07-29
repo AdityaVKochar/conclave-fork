@@ -55,6 +55,7 @@ type MeetsClientPageProps = {
   joinMode?: JoinMode;
   autoJoinOnMount?: boolean;
   hideJoinUI?: boolean;
+  webinarTitle?: string;
   user?: {
     id?: string;
     email?: string | null;
@@ -71,6 +72,7 @@ export default function MeetsClientPage({
   joinMode = "meeting",
   autoJoinOnMount = false,
   hideJoinUI = false,
+  webinarTitle,
   user,
   isAdmin = false,
 }: MeetsClientPageProps) {
@@ -180,6 +182,7 @@ export default function MeetsClientPage({
         joinMode={joinMode}
         autoJoinOnMount={autoJoinOnMount}
         hideJoinUI={hideJoinUI}
+        webinarTitle={webinarTitle}
         getJoinInfo={getJoinInfo}
         getRooms={getRooms}
         getRoom={getRoom}

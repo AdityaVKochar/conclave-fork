@@ -31,3 +31,15 @@ CODE_SIGNING_REQUIRED = NO
 CODE_SIGNING_REQUIRED[sdk=iphoneos*] = YES
 CODE_SIGN_STYLE = Automatic
 CODE_SIGN_ENTITLEMENTS = Entitlements.plist
+
+// Debug device signing stays automatic by default. Headless builds can inject
+// manual profile values on the xcodebuild command line without committing one
+// developer's profile names to the project.
+CONCLAVE_DEBUG_CODE_SIGN_STYLE = Automatic
+CONCLAVE_DEBUG_CODE_SIGN_IDENTITY = Apple Development
+CONCLAVE_DEVELOPMENT_TEAM =
+CONCLAVE_APP_DEBUG_PROVISIONING_PROFILE =
+CODE_SIGN_STYLE[config=Debug][sdk=iphoneos*] = $(CONCLAVE_DEBUG_CODE_SIGN_STYLE)
+DEVELOPMENT_TEAM[config=Debug][sdk=iphoneos*] = $(CONCLAVE_DEVELOPMENT_TEAM)
+CODE_SIGN_IDENTITY[config=Debug][sdk=iphoneos*] = $(CONCLAVE_DEBUG_CODE_SIGN_IDENTITY)
+PROVISIONING_PROFILE_SPECIFIER[config=Debug][sdk=iphoneos*] = $(CONCLAVE_APP_DEBUG_PROVISIONING_PROFILE)

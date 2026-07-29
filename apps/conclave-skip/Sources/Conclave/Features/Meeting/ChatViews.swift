@@ -1,6 +1,7 @@
 import Foundation
 import SwiftUI
 import Observation
+import SkipKit
 #if canImport(UIKit) && !SKIP
 import UIKit
 #endif
@@ -55,7 +56,11 @@ enum ChatComposerLayout {
     }
 
     static func composerBottomPadding(isAndroid: Bool, contentInset: CGFloat) -> CGFloat {
-        composerVerticalPadding(isAndroid: isAndroid) + max(0.0, contentInset)
+        // contentInset is the total clearance requested by the host (home
+        // indicator or keyboard), not extra spacing to stack below the normal
+        // composer padding. Taking the maximum avoids the dead strip that used
+        // to appear below the input on iPhones with a home indicator.
+        max(composerVerticalPadding(isAndroid: isAndroid), contentInset)
     }
 
     static func suggestionPopoverHeight(itemCount: Int, maxHeight: CGFloat) -> CGFloat {
@@ -195,15 +200,11 @@ struct ChatOverlayView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .acmColorBackground(ACMColors.surface)
-        .overlay(alignment: .leading) {
-            // Left divider so the panel reads as a dock against the stage
-            // (matches the web chat's `border-l`); at the screen edge on phones.
-            Rectangle().fill(ACMColors.border).frame(width: 1)
-        }
-        .overlay(alignment: .top) {
-            // Top hairline: the dock starts mid-screen below the header, and
-            // without a bounded top edge it reads as a clipped rectangle.
-            Rectangle().fill(ACMColors.border).frame(height: 1)
+        .overlay {
+            // Draw the outline inside the panel bounds. A regular stroke puts
+            // half its width outside the trailing screen edge, which made the
+            // right side look clipped while the left divider stayed visible.
+            Rectangle().strokeBorder(ACMColors.border, lineWidth: 1)
         }
         .onDisappear {
             reportFocus(false)
@@ -236,6 +237,7 @@ struct ChatOverlayView: View {
             displayName: message.displayName,
             content: replyPreviewContent(for: message),
             hasGif: message.gif != nil,
+            hasImage: message.image != nil,
             isDirect: message.isDirect,
             dmTargetUserId: message.dmTargetUserId
         )
@@ -245,6 +247,10 @@ struct ChatOverlayView: View {
         if let gif = message.gif {
             let title = gif.title.trimmingCharacters(in: .whitespacesAndNewlines)
             return title.isEmpty ? "GIF" : title
+        }
+        if let image = message.image {
+            let caption = message.content.trimmingCharacters(in: .whitespacesAndNewlines)
+            return caption.isEmpty || caption == image.fileName ? "Image" : caption
         }
         let content = ChatMessagePresentation.content(for: message).trimmingCharacters(in: .whitespacesAndNewlines)
         if content.isEmpty {
@@ -265,6 +271,8 @@ private struct ChatComposerView: View {
     let onSuggestionCountsChanged: (Int, Int) -> Void
     @State private var messageText = ""
     @State private var showGifPicker = false
+    @State private var showImagePicker = false
+    @State private var pickedImageURL: URL?
     @FocusState private var isInputFocused: Bool
     private let maxChatInputLength = 1000
 
@@ -385,31 +393,51 @@ private struct ChatComposerView: View {
                 )
             }
 
-            HStack(alignment: .bottom, spacing: 10) {
-                Button {
-                    isInputFocused = false
-                    showGifPicker = true
-                } label: {
-                    HStack(spacing: 5) {
-                        ACMSystemIcon.icon("photo.stack", android: "gif", size: 13)
-                        Text("GIF")
-                            .font(ACMFont.trial(11, weight: .semibold))
+            HStack(alignment: .bottom, spacing: 8) {
+                Menu {
+                    Button(action: openGifPicker) {
+                        Label {
+                            Text("Add GIF")
+                        } icon: {
+                            ACMSystemIcon.icon("photo.stack", android: "gif", size: 15)
+                        }
                     }
-                    .foregroundStyle(isChatDisabled ? ACMColors.textFaint : ACMColors.textMuted)
-                    .frame(width: 58, height: inputHeight)
+
+                    if viewModel.state.isImageAttachmentsEnabled {
+                        Button(action: openImagePicker) {
+                            Label {
+                                Text(viewModel.state.isChatImageUploading ? "Uploading photo…" : "Attach photo")
+                            } icon: {
+                                ACMSystemIcon.icon("photo", android: "image", size: 15)
+                            }
+                        }
+                        .disabled(viewModel.state.isChatImageUploading)
+                    }
+                } label: {
+                    Group {
+                        if viewModel.state.isChatImageUploading {
+                            ProgressView()
+                                .tint(ACMColors.primaryOrange)
+                                .scaleEffect(0.7)
+                        } else {
+                            ACMSystemIcon.icon("plus", android: "add", size: 17)
+                                .foregroundStyle(isChatDisabled ? ACMColors.textFaint : ACMColors.textMuted)
+                        }
+                    }
+                    .frame(width: inputHeight, height: inputHeight)
                     .acmColorBackground(ACMColors.surfaceRaised)
                     .overlay {
-                        Capsule().strokeBorder(ACMColors.border, lineWidth: 1)
+                        Circle().strokeBorder(ACMColors.border, lineWidth: 1)
                     }
-                    .clipShape(Capsule())
+                    .clipShape(Circle())
                 }
                 .buttonStyle(.plain)
-                .frame(width: 58, height: inputHeight)
+                .frame(width: inputHeight, height: inputHeight)
                 #if !SKIP
-                .contentShape(Capsule())
+                .contentShape(Circle())
                 #endif
                 .disabled(isChatDisabled)
-                .accessibilityLabel("Add a GIF")
+                .accessibilityLabel("Add GIF or photo")
 
                 #if SKIP
                 TextField(placeholder, text: messageTextBinding)
@@ -450,6 +478,7 @@ private struct ChatComposerView: View {
                     .submitLabel(SubmitLabel.send)
                     .onSubmit { sendMessage() }
                     .disabled(isChatDisabled)
+                    .layoutPriority(1)
                 #endif
 
                 Button {
@@ -544,8 +573,48 @@ private struct ChatComposerView: View {
             GifPickerView(onSelect: sendGif)
         }
         #endif
+        .withMediaPicker(
+            type: MediaPickerType.library,
+            isPresented: $showImagePicker,
+            selectedImageURL: $pickedImageURL
+        )
+        .onChange(of: pickedImageURL) {
+            guard let url = pickedImageURL else { return }
+            pickedImageURL = nil
+            sendPickedImage(url)
+        }
         .onDisappear {
             onFocusChanged(false)
+        }
+    }
+
+    private func openGifPicker() {
+        isInputFocused = false
+        showGifPicker = true
+    }
+
+    private func openImagePicker() {
+        guard viewModel.state.isImageAttachmentsEnabled,
+              !viewModel.state.isChatImageUploading else { return }
+        isInputFocused = false
+        showImagePicker = true
+    }
+
+    private func sendPickedImage(_ url: URL) {
+        guard !isChatDisabled else { return }
+        let caption = messageText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let activeReply = replyTarget
+        replyTarget = nil
+        messageText = ""
+        HapticManager.shared.trigger(.light)
+        Task {
+            let sent = await viewModel.sendChatImage(fileURL: url, caption: caption, replyTo: activeReply)
+            // A failed upload should not eat the user's draft: put the caption
+            // and reply back unless they already started something new.
+            if !sent {
+                if messageText.isEmpty { messageText = caption }
+                if replyTarget == nil { replyTarget = activeReply }
+            }
         }
     }
 
@@ -620,6 +689,17 @@ enum ChatAutoScrollPolicy {
     }
 }
 
+/// Reference box for bottom-sentinel tracking. Appearance callbacks re-fire on
+/// body re-runs (SwiftUI merges and re-invokes them when the modifier value is
+/// replaced), so they must never write observed view state - an @State write
+/// from onAppear/onDisappear re-invalidates body, which re-fires the callbacks,
+/// and the timeline spins at 100% CPU until the watchdog kills the app. Fields
+/// on this box are plain storage: reads happen inside discrete event handlers
+/// (new-message onChange), never in body, so no observation is needed.
+private final class ChatBottomSentinelBox {
+    var isAtBottom = true
+}
+
 private struct ChatTimelineView: View, Equatable {
     let chatMessages: [ChatMessage]
     let systemMessages: [SystemMessage]
@@ -632,7 +712,7 @@ private struct ChatTimelineView: View, Equatable {
     let onReply: (ChatMessage) -> Void
     @State private var delayedScrollTask: Task<Void, Never>?
     @State private var observedLatestEntryId: String?
-    @State private var isAtBottom = true
+    @State private var sentinelBox = ChatBottomSentinelBox()
     @State private var unseenCount = 0
     @State private var actionMessageId: String?
 
@@ -665,7 +745,7 @@ private struct ChatTimelineView: View, Equatable {
 
     var body: some View {
         let _ = PerformanceDiagnostics.render("ChatTimelineView") {
-            "chat=\(chatMessages.count) system=\(systemMessages.count) focused=\(isInputFocused) atBottom=\(isAtBottom)"
+            "chat=\(chatMessages.count) system=\(systemMessages.count) focused=\(isInputFocused) unseen=\(unseenCount)"
         }
         let entries = timeline
         let latestEntryId = entries.last?.id
@@ -684,15 +764,18 @@ private struct ChatTimelineView: View, Equatable {
                         }
 
                         // Bottom sentinel: while it is composed the reader is
-                        // effectively at the end of the timeline.
+                        // effectively at the end of the timeline. Track it in
+                        // the non-observed box (see ChatBottomSentinelBox); the
+                        // only @State write here is clearing the unseen pill,
+                        // guarded so it is a no-op unless a pill is showing.
                         Color.clear
                             .frame(height: 1)
                             .onAppear {
-                                isAtBottom = true
-                                unseenCount = 0
+                                sentinelBox.isAtBottom = true
+                                if unseenCount != 0 { unseenCount = 0 }
                             }
                             .onDisappear {
-                                isAtBottom = false
+                                sentinelBox.isAtBottom = false
                             }
                     }
                     .padding(.horizontal, 14)
@@ -700,7 +783,10 @@ private struct ChatTimelineView: View, Equatable {
                 }
             }
             .overlay(alignment: .bottom) {
-                if unseenCount > 0 && !isAtBottom {
+                // Reaching the bottom clears the count via the sentinel, so the
+                // pill's visibility only needs the count itself (body must not
+                // read the sentinel box - it is deliberately unobserved).
+                if unseenCount > 0 {
                     ChatNewMessagesPill(count: unseenCount) {
                         unseenCount = 0
                         scrollToLatestMessage(in: entries, proxy: proxy)
@@ -723,6 +809,9 @@ private struct ChatTimelineView: View, Equatable {
             }
 #else
             .onChange(of: latestEntryId) { previousEntryId, currentEntryId in
+                // Keep the appear-guard's baseline in sync so onAppear refires
+                // do not treat an already-observed entry as new.
+                observedLatestEntryId = currentEntryId
                 guard ChatTimelineScrollPolicy.shouldScrollToLatest(
                     previousEntryId: previousEntryId,
                     currentEntryId: currentEntryId
@@ -733,6 +822,11 @@ private struct ChatTimelineView: View, Equatable {
             }
 #endif
             .onAppear {
+                // Appearance callbacks can re-fire on body re-runs; only the
+                // first mount (or a genuinely new latest entry) may scroll,
+                // otherwise the scroll + state write re-invalidates body and
+                // the view spins at 100% CPU.
+                guard observedLatestEntryId != latestEntryId else { return }
                 observedLatestEntryId = latestEntryId
                 scrollToLatestMessage(in: entries, proxy: proxy, animated: false)
                 scheduleDelayedScroll(in: entries, proxy: proxy, animated: false)
@@ -766,7 +860,7 @@ private struct ChatTimelineView: View, Equatable {
 
     private func handleNewLatestEntry(entries: [ChatTimelineEntry], proxy: ScrollViewProxy) {
         if ChatAutoScrollPolicy.shouldAutoScroll(
-            isAtBottom: isAtBottom,
+            isAtBottom: sentinelBox.isAtBottom,
             latestIsFromLocalUser: latestEntryIsFromLocalUser(entries)
         ) {
             unseenCount = 0
@@ -805,7 +899,18 @@ private struct ChatTimelineView: View, Equatable {
             let isReplyFromCurrentUser = message.replyTo.map { reply in
                 isCurrentUser(reply.userId)
             } == true
-            let grouped = ChatGroupingPolicy.grouped(message: message, previous: previousMessage)
+            // The server and SFU can use different raw ids for the same local
+            // participant. Optimistic sends use the SFU id, while the echo may
+            // use the account/session id; treat both as one canonical sender so
+            // a follow-up message is grouped before its acknowledgement arrives.
+            let sameLocalSender = isFromCurrentUser && previousMessage.map { previous in
+                isCurrentUser(previous.userId)
+            } == true
+            let grouped = ChatGroupingPolicy.grouped(
+                message: message,
+                previous: previousMessage,
+                sameLocalSender: sameLocalSender
+            )
             if let actionText = ChatMessagePresentation.actionText(from: message.content) {
                 ChatActionMessageRow(
                     message: message,
@@ -1447,9 +1552,13 @@ struct ChatActionMessageRow: View {
 enum ChatGroupingPolicy {
     static let groupWindowSeconds: TimeInterval = 300
 
-    static func grouped(message: ChatMessage, previous: ChatMessage?) -> Bool {
+    static func grouped(
+        message: ChatMessage,
+        previous: ChatMessage?,
+        sameLocalSender: Bool = false
+    ) -> Bool {
         guard let previous else { return false }
-        return previous.userId == message.userId
+        return (previous.userId == message.userId || sameLocalSender)
             && previous.isDirect == message.isDirect
             && previous.dmTargetUserId == message.dmTargetUserId
             && message.timestamp.timeIntervalSince(previous.timestamp) < groupWindowSeconds
@@ -1607,7 +1716,24 @@ struct ChatMessageRow: View {
 
     @ViewBuilder
     private var messageContent: some View {
-        if let gif = message.gif {
+        if let image = message.image {
+            // Web parity (chatImageCaption): the server substitutes the file
+            // name for an empty caption; suppress it so bare images show no
+            // caption bar.
+            let trimmedCaption = message.content.trimmingCharacters(in: .whitespacesAndNewlines)
+            ChatImageMessageView(
+                image: image,
+                caption: trimmedCaption == image.fileName ? "" : trimmedCaption
+            )
+            .overlay {
+                if message.isDirect {
+                    RoundedRectangle(cornerRadius: ACMRadius.lg)
+                        .strokeBorder(lineWidth: 1)
+                        .foregroundStyle(ACMColors.handRaisedBorder)
+                }
+            }
+            .frame(maxWidth: 280, alignment: isFromCurrentUser ? .trailing : .leading)
+        } else if let gif = message.gif {
             ChatGifAttachmentView(gif: gif)
                 .overlay {
                     if message.isDirect {
@@ -1852,6 +1978,131 @@ enum ChatMessageLinkParser {
     private static let asciiNumbers = "0123456789"
 }
 
+/// An uploaded image in the timeline: rounded frame, tap for a full-screen
+/// viewer, optional caption bar underneath (the message content rides as the
+/// caption, like the web's ChatImageAttachmentView).
+struct ChatImageMessageView: View {
+    let image: ChatImageAttachment
+    let caption: String
+    @State private var isExpanded = false
+
+    private var imageURL: URL? { URL(string: image.url) }
+
+    var body: some View {
+        Button {
+            isExpanded = true
+        } label: {
+            VStack(alignment: .leading, spacing: 0) {
+                if let imageURL {
+                    // Fixed-HEIGHT stage for every load phase. The bubble's
+                    // height must NOT depend on whether the bitmap has loaded:
+                    // LazyVStack evicts row state off-screen, so phase-sized
+                    // frames make content height oscillate, which re-solves the
+                    // bottom-anchored scroll, re-toggles the sentinel, and
+                    // spins the timeline at 100% CPU until the watchdog kills
+                    // the app (0x8BADF00D, seen 2026-07-17). Width flexes up to
+                    // 280 so compact panels never clip the row; Color.clear
+                    // keeps the stage greedy while the spinner shows.
+                    ZStack {
+                        Color.clear
+                        AsyncImage(url: imageURL) { phase in
+                            if let loaded = phase.image {
+                                loaded
+                                    .resizable()
+                                    .scaledToFit()
+                            } else if phase.error != nil {
+                                VStack(spacing: 6) {
+                                    ACMSystemIcon.icon("photo.badge.exclamationmark", android: "warning", size: 22)
+                                        .foregroundStyle(ACMColors.textFaint)
+                                    Text("Couldn't load image")
+                                        .font(ACMFont.trial(12))
+                                        .foregroundStyle(ACMColors.textMuted)
+                                }
+                            } else {
+                                ProgressView()
+                                    .tint(ACMColors.primaryOrange)
+                            }
+                        }
+                    }
+                    .frame(maxWidth: 280)
+                    .frame(height: 220)
+                }
+                if !caption.isEmpty {
+                    Text(caption)
+                        .font(ACMFont.trial(13.5))
+                        .foregroundStyle(ACMColors.text)
+                        .lineSpacing(2)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 8)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .acmColorBackground(ACMColors.surfaceRaised)
+                        .overlay(alignment: .top) {
+                            Rectangle().fill(ACMColors.border).frame(height: 1)
+                        }
+                }
+            }
+            .acmColorBackground(Color.black.opacity(0.3))
+            .clipShape(RoundedRectangle(cornerRadius: ACMRadius.lg))
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("View \(image.fileName) full screen")
+#if SKIP
+        .sheet(isPresented: $isExpanded) {
+            ChatImageLightboxView(image: image, onClose: { isExpanded = false })
+        }
+#elseif os(iOS)
+        .fullScreenCover(isPresented: $isExpanded) {
+            ChatImageLightboxView(image: image, onClose: { isExpanded = false })
+        }
+#else
+        .sheet(isPresented: $isExpanded) {
+            ChatImageLightboxView(image: image, onClose: { isExpanded = false })
+        }
+#endif
+    }
+}
+
+/// Full-screen viewer for a chat image (the web lightbox's native sibling).
+struct ChatImageLightboxView: View {
+    let image: ChatImageAttachment
+    let onClose: () -> Void
+
+    var body: some View {
+        ZStack(alignment: .topTrailing) {
+            Color.black.ignoresSafeArea()
+
+            if let url = URL(string: image.url) {
+                AsyncImage(url: url) { loaded in
+                    loaded
+                        .resizable()
+                        .scaledToFit()
+                } placeholder: {
+                    ProgressView()
+                        .tint(ACMColors.primaryOrange)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .padding(16)
+            }
+
+            Button {
+                onClose()
+            } label: {
+                ACMSystemIcon.icon("xmark", android: "close", size: 15)
+                    .foregroundStyle(Color.white)
+                    .frame(width: 38, height: 38)
+                    .acmColorBackground(Color.black.opacity(0.4))
+                    .overlay {
+                        Circle().strokeBorder(lineWidth: 1).foregroundStyle(Color.white.opacity(0.15))
+                    }
+                    .clipShape(Circle())
+            }
+            .buttonStyle(.plain)
+            .padding(16)
+            .accessibilityLabel("Close image preview")
+        }
+    }
+}
+
 struct ChatGifAttachmentView: View {
     let gif: ChatGifAttachment
 
@@ -2058,7 +2309,7 @@ struct ChatReplyComposerView: View {
     let onCancel: () -> Void
 
     private var previewText: String {
-        replyTo.hasGif ? "GIF" : replyTo.content
+        replyTo.hasGif ? "GIF" : (replyTo.hasImage == true ? "Image" : replyTo.content)
     }
 
     var body: some View {
@@ -2113,7 +2364,7 @@ struct ChatReplyQuoteView: View {
     let isReplyFromCurrentUser: Bool
 
     private var previewText: String {
-        replyTo.hasGif ? "GIF" : replyTo.content
+        replyTo.hasGif ? "GIF" : (replyTo.hasImage == true ? "Image" : replyTo.content)
     }
 
     var body: some View {

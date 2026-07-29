@@ -44,8 +44,9 @@ struct MeetingBannerOverlay: View {
     @State private var dismissedQualitySeverity: Int = 0
 
     private var isRecovering: Bool {
-        viewModel.state.isRecoveringConnection ||
-            viewModel.state.connectionState == ConnectionState.reconnecting
+        !viewModel.state.isResumingFromBackground &&
+            (viewModel.state.isRecoveringConnection ||
+                viewModel.state.connectionState == ConnectionState.reconnecting)
     }
     private var isOffline: Bool {
         viewModel.state.isNetworkOffline
@@ -111,7 +112,7 @@ struct MeetingBannerOverlay: View {
                         iconTint: "amber",
                         iconColor: ACMColors.primaryOrange,
                         text: viewModel.state.serverRestartNotice ??
-                            "Connection interrupted. Restoring audio and video — mic and camera changes will be applied.",
+                            "Connection interrupted. Restoring audio and video. Mic and camera changes will be applied.",
                         background: ACMColors.surfaceRaised,
                         border: ACMColors.border,
                         showSpinner: true
@@ -164,6 +165,16 @@ struct MeetingBannerOverlay: View {
                         )
                     }
                     .buttonStyle(.plain)
+                } else if viewModel.state.isAudioOnlyMode {
+                    MeetingBanner(
+                        iosIcon: "waveform",
+                        androidIcon: "headphones",
+                        iconTint: "accent",
+                        iconColor: ACMColors.primaryOrange,
+                        text: "Audio-only mode is active. Video is not being sent or received.",
+                        background: ACMColors.surfaceRaised,
+                        border: ACMColors.primaryOrange.opacity(0.34)
+                    )
                 } else if shouldShowQualityBanner, let info = qualityBannerInfo {
                     MeetingBanner(
                         iosIcon: info.iosIcon,

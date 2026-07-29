@@ -29,7 +29,7 @@ const session = (
     startedAt: 1,
     lastSeenAt: 2,
   },
-  transcriptModel: "gpt-realtime-whisper",
+  transcriptModel: "gpt-live-transcribe",
   qaModel: "gpt-5.6-terra",
   transportMode: "browser",
   keySource: "global",

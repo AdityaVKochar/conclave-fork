@@ -7,6 +7,7 @@ import {
   Image as ImageIcon,
   Link2,
   Lock,
+  MessageCircleQuestion,
   MessageSquare,
   MessageSquareLock,
   RotateCw,
@@ -808,6 +809,20 @@ export default function MeetSettingsPanel({
                       void withWebinarTask(async () => {
                         await updateWebinarConfig({
                           locked: !Boolean(webinarConfig?.locked),
+                        });
+                      })
+                    }
+                    disabled={isWebinarWorking}
+                  />
+                  <SwitchRow
+                    icon={MessageCircleQuestion}
+                    label="Attendee Q&A"
+                    isOn={webinarConfig?.qaEnabled !== false}
+                    tone="success"
+                    onClick={() =>
+                      void withWebinarTask(async () => {
+                        await updateWebinarConfig({
+                          qaEnabled: !(webinarConfig?.qaEnabled !== false),
                         });
                       })
                     }
