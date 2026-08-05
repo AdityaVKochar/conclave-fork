@@ -13,21 +13,6 @@ import { errorName } from "../lib/utils";
 // after a sink change — which no transport-level watchdog can see (#177).
 const PLAYBACK_WATCHDOG_INTERVAL_MS = 5000;
 
-let sharedParticipantAudioContext: AudioContext | null = null;
-
-const getParticipantAudioContext = (): AudioContext | null => {
-  if (sharedParticipantAudioContext?.state !== "closed") {
-    return sharedParticipantAudioContext;
-  }
-  const AudioContextConstructor =
-    window.AudioContext ||
-    (window as typeof window & { webkitAudioContext?: typeof AudioContext })
-      .webkitAudioContext;
-  if (!AudioContextConstructor) return null;
-  sharedParticipantAudioContext = new AudioContextConstructor();
-  return sharedParticipantAudioContext;
-};
-
 const playerConfigs = {
   participant: {
     playbackErrorMessage: "[Meets] Audio play error:",
@@ -85,8 +70,6 @@ function AudioStreamPlayer({
   volumeMultiplier = 1,
 }: AudioStreamPlayerProps) {
   const audioRef = useRef<HTMLAudioElement>(null);
-  const participantAudioContextRef = useRef<AudioContext | null>(null);
-  const participantGainRef = useRef<GainNode | null>(null);
   const autoplayBlockedRef = useRef(false);
   const reportedStallRef = useRef(false);
   const { meetVolume } = useMeetVolume();
@@ -107,14 +90,7 @@ function AudioStreamPlayer({
     const audio = audioRef.current;
     if (!audio || !stream || muted) return;
 
-    const audioContext = participantAudioContextRef.current;
-    const resumeAudioContext =
-      audioContext?.state === "suspended"
-        ? audioContext.resume()
-        : Promise.resolve();
-
-    resumeAudioContext
-      .then(() => audio.play())
+    audio.play()
       .then(() => {
         autoplayBlockedRef.current = false;
         if (reportedStallRef.current) {
@@ -160,32 +136,9 @@ function AudioStreamPlayer({
     audio.defaultMuted = muted;
     audio.muted = muted;
 
-    let playbackStream = stream;
-    let sourceNode: MediaStreamAudioSourceNode | null = null;
-    let gainNode: GainNode | null = null;
-    let destinationNode: MediaStreamAudioDestinationNode | null = null;
-    if (kind === "participant" && stream.getAudioTracks().length > 0) {
-      try {
-        const audioContext = getParticipantAudioContext();
-        if (audioContext) {
-          sourceNode = audioContext.createMediaStreamSource(stream);
-          gainNode = audioContext.createGain();
-          destinationNode = audioContext.createMediaStreamDestination();
-          gainNode.gain.value = clampParticipantVolume(volumeMultiplier);
-          sourceNode.connect(gainNode);
-          gainNode.connect(destinationNode);
-          playbackStream = destinationNode.stream;
-          participantAudioContextRef.current = audioContext;
-          participantGainRef.current = gainNode;
-        }
-      } catch (error) {
-        console.warn("[Meets] Participant volume processing unavailable:", error);
-      }
-    }
-
-    if (audio.srcObject !== playbackStream) {
+    if (audio.srcObject !== stream) {
       audio.srcObject = null;
-      audio.srcObject = playbackStream;
+      audio.srcObject = stream;
     }
 
     let cancelled = false;
@@ -263,15 +216,8 @@ function AudioStreamPlayer({
       window.removeEventListener("pointerdown", handleUserGesture, true);
       window.removeEventListener("keydown", handleUserGesture, true);
       playbackRecovery.clear();
-      if (audio.srcObject === playbackStream) {
+      if (audio.srcObject === stream) {
         audio.srcObject = null;
-      }
-      sourceNode?.disconnect();
-      gainNode?.disconnect();
-      destinationNode?.stream.getTracks().forEach((track) => track.stop());
-      if (participantGainRef.current === gainNode) {
-        participantGainRef.current = null;
-        participantAudioContextRef.current = null;
       }
     };
   }, [
@@ -310,18 +256,8 @@ function AudioStreamPlayer({
     const audio = audioRef.current;
     if (!audio) return;
     const participantVolume = clampParticipantVolume(volumeMultiplier);
-    const gainNode = participantGainRef.current;
-    if (gainNode) {
-      const context = participantAudioContextRef.current;
-      gainNode.gain.setValueAtTime(
-        participantVolume,
-        context?.currentTime ?? 0,
-      );
-      audio.volume = meetVolume;
-      return;
-    }
     audio.volume = Math.min(1, meetVolume * participantVolume);
-  }, [meetVolume, volumeMultiplier]);
+  }, [elementKey, meetVolume, volumeMultiplier]);
 
   return (
     <audio

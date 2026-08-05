@@ -46,11 +46,13 @@ export function MeetVolumeProvider({
   const [participantVolumes, setParticipantVolumes] = useState<
     ReadonlyMap<string, number>
   >(() => new Map());
-  const getParticipantVolume = useCallback(
-    (userId: string) =>
-      participantVolumes.get(userId) ?? DEFAULT_PARTICIPANT_VOLUME,
-    [participantVolumes],
-  );
+  const getParticipantVolume = useCallback((userId: string) => {
+    const normalizedUserId = userId.trim();
+    if (!normalizedUserId) return DEFAULT_PARTICIPANT_VOLUME;
+    return (
+      participantVolumes.get(normalizedUserId) ?? DEFAULT_PARTICIPANT_VOLUME
+    );
+  }, [participantVolumes]);
   const setParticipantVolume = useCallback((userId: string, volume: number) => {
     const normalizedUserId = userId.trim();
     if (!normalizedUserId) return;
