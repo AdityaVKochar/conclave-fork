@@ -1,6 +1,6 @@
 export const DEFAULT_MEET_VOLUME = 1;
 export const DEFAULT_PARTICIPANT_VOLUME = 1;
-export const MAX_PARTICIPANT_VOLUME = 2;
+export const MAX_PARTICIPANT_VOLUME = 1;
 
 export const clampMeetVolume = (value: number): number => {
   if (!Number.isFinite(value)) return DEFAULT_MEET_VOLUME;

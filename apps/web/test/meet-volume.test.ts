@@ -15,9 +15,10 @@ describe("meet volume", () => {
     expect(clampMeetVolume(Number.NaN)).toBe(DEFAULT_MEET_VOLUME);
   });
 
-  it("allows participant gain up to 200% volume", () => {
+  it("keeps participant volume between silence and unity", () => {
     expect(clampParticipantVolume(-1)).toBe(0);
-    expect(clampParticipantVolume(1.35)).toBe(1.35);
+    expect(clampParticipantVolume(0.65)).toBe(0.65);
+    expect(clampParticipantVolume(1.35)).toBe(MAX_PARTICIPANT_VOLUME);
     expect(clampParticipantVolume(8)).toBe(MAX_PARTICIPANT_VOLUME);
     expect(clampParticipantVolume(Number.NaN)).toBe(
       DEFAULT_PARTICIPANT_VOLUME,
